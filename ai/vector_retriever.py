@@ -7,6 +7,7 @@ import math
 import os
 import re
 from collections.abc import Iterable
+from pathlib import Path
 
 import numpy as np
 
@@ -90,16 +91,30 @@ def create_default_encoder():
 
 
 class VectorIndex:
-    def __init__(self, documents: Iterable[BM25Document] = (), *, encoder=None, dimensions: int = 384):
+    def __init__(
+        self,
+        documents: Iterable[BM25Document] = (),
+        *,
+        encoder=None,
+        dimensions: int = 384,
+        cache_path: str | Path | None = None,
+    ):
         self.encoder = encoder or create_default_encoder()
         self.backend = "bge" if isinstance(self.encoder, BGEChineseEncoder) else "hash"
         self.fallback_reason: str | None = None
+        self.cache_path = Path(cache_path) if cache_path is not None else None
+        self.cache_status = "disabled" if self.cache_path is None else "miss"
         self.documents: list[BM25Document] = []
         self.vectors: list[list[float]] = []
         self.add_documents(documents)
 
     def add_documents(self, documents: Iterable[BM25Document]) -> None:
         pending = list(documents)
+        if not pending:
+            return
+        initial_load = not self.documents
+        if initial_load and self._load_cached_vectors(pending):
+            return
         try:
             vectors = [self.encoder.encode(f"{document.title} {document.text}") for document in pending]
         except Exception as exc:
@@ -110,6 +125,90 @@ class VectorIndex:
             vectors = [self.encoder.encode(f"{document.title} {document.text}") for document in pending]
         self.documents.extend(pending)
         self.vectors.extend(vectors)
+        if initial_load:
+            self._write_cache(pending, vectors)
+
+    def _load_cached_vectors(self, documents: list[BM25Document]) -> bool:
+        if self.cache_path is None or not self.cache_path.exists():
+            return False
+        try:
+            with np.load(self.cache_path, allow_pickle=False) as cached:
+                fingerprint = str(cached["fingerprint"].item())
+                if fingerprint != self._documents_fingerprint(documents):
+                    return False
+                cached_encoder = str(cached["encoder"].item())
+                cached_backend = str(cached["backend"].item())
+                if cached_encoder == "hash":
+                    if isinstance(self.encoder, BGEChineseEncoder):
+                        self.encoder = ChineseHashEncoder()
+                    elif not isinstance(self.encoder, ChineseHashEncoder):
+                        return False
+                elif cached_encoder.startswith("bge:"):
+                    if cached_encoder != self._encoder_key():
+                        return False
+                    try:
+                        self.encoder._load()
+                    except Exception:
+                        return False
+                elif cached_encoder != self._encoder_key():
+                    return False
+                vectors = np.asarray(cached["vectors"], dtype=np.float32)
+                if vectors.ndim != 2 or vectors.shape[0] != len(documents):
+                    return False
+                if not np.isfinite(vectors).all():
+                    return False
+            self.backend = cached_backend
+            self.documents.extend(documents)
+            self.vectors.extend(vectors.tolist())
+            self.cache_status = "hit"
+            return True
+        except (OSError, EOFError, KeyError, ValueError):
+            # A stale or corrupt optimization cache must never block retrieval.
+            self.cache_status = "invalid"
+            return False
+
+    def _write_cache(
+        self, documents: list[BM25Document], vectors: list[list[float]]
+    ) -> None:
+        if self.cache_path is None:
+            return
+        temporary_path = self.cache_path.with_suffix(
+            f"{self.cache_path.suffix}.{os.getpid()}.tmp"
+        )
+        try:
+            self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+            with temporary_path.open("wb") as stream:
+                np.savez_compressed(
+                    stream,
+                    fingerprint=self._documents_fingerprint(documents),
+                    encoder=self._encoder_key(),
+                    backend=self.backend,
+                    vectors=np.asarray(vectors, dtype=np.float32),
+                )
+            os.replace(temporary_path, self.cache_path)
+            self.cache_status = "written"
+        except (OSError, ValueError):
+            self.cache_status = "write_failed"
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _encoder_key(self) -> str:
+        if isinstance(self.encoder, BGEChineseEncoder):
+            return f"bge:{self.encoder.model_name}"
+        if isinstance(self.encoder, ChineseHashEncoder):
+            return "hash"
+        return f"custom:{type(self.encoder).__module__}.{type(self.encoder).__qualname__}"
+
+    @staticmethod
+    def _documents_fingerprint(documents: Iterable[BM25Document]) -> str:
+        digest = hashlib.sha256()
+        for document in documents:
+            for value in (document.doc_id, document.title, document.text):
+                digest.update(str(value).encode("utf-8"))
+                digest.update(b"\0")
+        return digest.hexdigest()
 
     def search(self, query: str, *, top_k: int = 4) -> list[tuple[BM25Document, float]]:
         query_vector = self.encoder.encode(query)

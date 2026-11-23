@@ -2,25 +2,65 @@
 
 from __future__ import annotations
 
-import re
+import hashlib
 import json
 import os
+import re
 from pathlib import Path
+from threading import RLock
 
 from .bm25 import BM25Document, BM25Index
 from .reranker import LocalReranker, create_default_reranker
 from .vector_retriever import VectorIndex
 
 
+_SHARED_KNOWLEDGE_BASES: dict[tuple[str, str], "ChineseKnowledgeBase"] = {}
+_SHARED_KNOWLEDGE_BASES_LOCK = RLock()
+
+
 class ChineseKnowledgeBase:
-    def __init__(self, root: str | Path | None = None, *, vector_encoder=None):
+    def __init__(
+        self,
+        root: str | Path | None = None,
+        *,
+        vector_encoder=None,
+        cache_dir: str | Path | None = None,
+    ):
         self.root = Path(root) if root is not None else Path(__file__).with_name("knowledge_base")
         self.quality_issues: list[str] = []
         documents = self._load_documents()
         self.index = BM25Index(documents)
-        self.vector_index = VectorIndex(documents, encoder=vector_encoder)
+        cache_path = None
+        if vector_encoder is None:
+            # Keep generated vectors outside the repository so packaged apps and
+            # source checkouts share the same cache without modifying project files.
+            cache_path = self._vector_cache_path(cache_dir)
+        self.vector_index = VectorIndex(
+            documents,
+            encoder=vector_encoder,
+            cache_path=cache_path,
+        )
         self.reranker = create_default_reranker()
         self.reranker_backend = type(self.reranker).__name__
+
+    def _vector_cache_path(self, cache_dir: str | Path | None) -> Path:
+        configured_dir = (
+            str(cache_dir).strip()
+            if cache_dir is not None
+            else os.getenv("CARDIO_KNOWLEDGE_CACHE", "").strip()
+        )
+        if configured_dir:
+            directory = Path(configured_dir).expanduser()
+        else:
+            local_app_data = os.getenv("LOCALAPPDATA", "").strip()
+            directory = (
+                Path(local_app_data) / "CardioScope" / "knowledge_cache"
+                if local_app_data
+                else Path.home() / ".cache" / "cardioscope" / "knowledge_cache"
+            )
+        root_key = str(self.root.resolve()).encode("utf-8")
+        root_digest = hashlib.sha256(root_key).hexdigest()[:16]
+        return directory / f"vectors-{root_digest}.npz"
 
     def _load_documents(self) -> list[BM25Document]:
         documents: list[BM25Document] = []
@@ -155,8 +195,26 @@ class ChineseKnowledgeBase:
         for document in self.index.documents:
             group = str((document.metadata or {}).get("source_group", "unknown"))
             source_counts[group] = source_counts.get(group, 0) + 1
-        return {"vector_backend": self.vector_index.backend, "fallback_reason": self.vector_index.fallback_reason, "reranker_backend": self.reranker_backend, "reranker_error": getattr(self, "reranker_error", None), "document_count": len(self.index.documents), "source_counts": source_counts, "quality_issues": list(self.quality_issues)}
+        return {"vector_backend": self.vector_index.backend, "vector_cache": self.vector_index.cache_status, "fallback_reason": self.vector_index.fallback_reason, "reranker_backend": self.reranker_backend, "reranker_error": getattr(self, "reranker_error", None), "document_count": len(self.index.documents), "source_counts": source_counts, "quality_issues": list(self.quality_issues)}
 
     def format_context(self, query: str, *, top_k: int = 4) -> str:
         hits = self.retrieve(query, top_k=top_k)
         return "\n\n".join(f"[KB-{i}] 来源：{doc.metadata.get('source', doc.doc_id) if doc.metadata else doc.doc_id} · 主题：{doc.metadata.get('domain', '未标注') if doc.metadata else '未标注'} · 证据级别：{doc.metadata.get('evidence_level', '未标注') if doc.metadata else '未标注'} · 版本：{doc.metadata.get('version', '未标注') if doc.metadata else '未标注'} · 重排分数 {score:.3f}\n{doc.text}" for i, (doc, score) in enumerate(hits, start=1))
+
+
+def _shared_cache_key() -> tuple[str, str]:
+    root = Path(__file__).with_name("knowledge_base").resolve()
+    external_corpus = os.getenv("CARDIO_KNOWLEDGE_CORPUS", "").strip()
+    return str(root), external_corpus
+
+
+def get_shared_knowledge_base() -> ChineseKnowledgeBase:
+    """Return the process-wide default knowledge base, initializing it once."""
+
+    key = _shared_cache_key()
+    with _SHARED_KNOWLEDGE_BASES_LOCK:
+        knowledge_base = _SHARED_KNOWLEDGE_BASES.get(key)
+        if knowledge_base is None:
+            knowledge_base = ChineseKnowledgeBase()
+            _SHARED_KNOWLEDGE_BASES[key] = knowledge_base
+        return knowledge_base

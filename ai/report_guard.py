@@ -27,7 +27,7 @@ def scan_risk(text: str) -> tuple[str, ...]:
     return tuple(name for name, pattern in _RISK_CATEGORIES.items() if pattern.search(text))
 
 
-def _citation_sources(knowledge_context: str) -> dict[str, str]:
+def citation_sources(knowledge_context: str) -> dict[str, str]:
     sources: dict[str, str] = {}
     blocks = knowledge_context.split("\n\n")
     for block in blocks:
@@ -35,6 +35,22 @@ def _citation_sources(knowledge_context: str) -> dict[str, str]:
         if match:
             sources[match.group(1)] = match.group(2).strip()
     return sources
+
+
+def unknown_citations(text: str, sources: dict[str, str]) -> tuple[str, ...]:
+    return tuple(sorted(set(_CITATION_RE.findall(text)).difference(sources)))
+
+
+def has_risky_wording(text: str) -> bool:
+    return any(pattern.search(text) for pattern in _RISK_PATTERNS)
+
+
+def requires_hard_block(text_risks: tuple[str, ...] | list[str], mode: str, strength: int) -> bool:
+    try:
+        normalized = max(0, min(100, int(strength)))
+    except (TypeError, ValueError):
+        normalized = 66
+    return bool(text_risks) and mode == "hard_block" and normalized >= 50
 
 
 def finalize_report(
@@ -48,17 +64,15 @@ def finalize_report(
 ) -> str:
     """Validate citation ids and append a deterministic reference list."""
     value = text.strip()
-    sources = _citation_sources(knowledge_context)
-    if sources:
-        unknown = sorted({number for number in _CITATION_RE.findall(value) if number not in sources})
-        if unknown:
-            value += "\n\n> 引用校验提示：检测到不存在的知识库引用编号：" + ", ".join(f"[KB-{n}]" for n in unknown)
-        if not re.search(r"^#{1,3}\s+参考知识\s*$", value, re.MULTILINE):
-            value += "\n\n## 参考知识\n" + "\n".join(
-                f"- [KB-{number}] {source}" for number, source in sources.items()
-            )
-    risks = [pattern.pattern for pattern in _RISK_PATTERNS if pattern.search(value)]
-    if risks:
+    sources = citation_sources(knowledge_context)
+    unknown = unknown_citations(value, sources)
+    if unknown:
+        value += "\n\n> 引用校验提示：检测到不存在的知识库引用编号：" + ", ".join(f"[KB-{n}]" for n in unknown)
+    if sources and not re.search(r"^#{1,3}\s+参考知识\s*$", value, re.MULTILINE):
+        value += "\n\n## 参考知识\n" + "\n".join(
+            f"- [KB-{number}] {source}" for number, source in sources.items()
+        )
+    if has_risky_wording(value):
         value += (
             "\n\n## 安全审核提示\n"
             "报告包含可能被理解为临床、治疗或安全性确定结论的表述。"
@@ -68,11 +82,7 @@ def finalize_report(
     if audit_notes:
         value += "\n\n## 机器审核结果\n" + "\n".join(f"- {note}" for note in audit_notes)
         value += "\n- 该报告需要人工复核后再作为正式结论使用。"
-    try:
-        strength = max(0, min(100, int(safety_strength)))
-    except (TypeError, ValueError):
-        strength = 66
-    if risk_categories and safety_mode == "hard_block" and strength >= 50:
+    if requires_hard_block(risk_categories, safety_mode, safety_strength):
         value += (
             "\n\n## 安全硬阻断\n"
             f"检测到高风险类别：{'、'.join(risk_categories)}。"
