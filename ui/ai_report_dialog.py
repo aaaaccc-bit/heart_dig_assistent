@@ -5,8 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import inspect
+import math
 import os
 from pathlib import Path
+from threading import Event
 
 from PySide6.QtCore import QObject, QThread, Qt, Signal, Slot
 from PySide6.QtGui import QCloseEvent
@@ -78,22 +80,42 @@ class CardioReportRecord:
     parameters: dict
 
 
+def _report_number(value):
+    """Convert NaN/inf to ``None`` so the prompt contains valid JSON."""
+
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, dict):
+        return {key: _report_number(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_report_number(item) for item in value]
+    return value
+
+
 def build_cardio_report_record(
     data: DashboardData,
     regression: RegressionResult | None = None,
     random_forest: RandomForestResult | None = None,
+    risk: object | None = None,
+    clusters: object | None = None,
+    evaluation: object | None = None,
+    features: object | None = None,
 ) -> CardioReportRecord:
-    """Adapt the current workbench result to the reference AI report contract."""
+    """Adapt the current workbench result to the reference AI report contract.
+
+    Every analysis is optional: the record only carries the sections whose
+    results were passed in, and the report prompt is fed the same structure.
+    """
 
     metrics = tuple(
         ReportMetric(metric.label, f"{metric.value}{metric.unit}", metric.badge)
         for metric in data.kpis
     )
-    highlights = (
+    highlights = [
         ReportHighlight("总体结果", f"样本 {data.total_count} 例，阳性 {data.positive_count} 例，阳性率 {data.positive_rate:.1f}%"),
         ReportHighlight("年龄分层", data.insight),
         ReportHighlight("性别与胸痛类型", data.positive_note),
-    )
+    ]
     parameters = {
         "阳性率": round(data.positive_rate, 2),
         "年龄段": [
@@ -153,6 +175,14 @@ def build_cardio_report_record(
                 "校准斜率": round(regression.validation.calibration_slope, 6),
             },
         }
+        highlights.append(
+            ReportHighlight(
+                "回归分析",
+                f"{'二元' if len(regression.predictors) == 2 else '多元'} Logistic 回归 "
+                f"ROC-AUC {regression.validation.roc_auc:.3f}，"
+                f"Brier {regression.validation.brier_score:.3f}",
+            )
+        )
     if random_forest is not None:
         validation = random_forest.validation
         parameters["随机森林分析"] = {
@@ -212,21 +242,184 @@ def build_cardio_report_record(
                 )
             ],
         }
+        highlights.append(
+            ReportHighlight(
+                "随机森林",
+                f"ROC-AUC {validation.roc_auc:.3f}，PR-AUC {validation.pr_auc:.3f}，"
+                f"校准后 Brier {validation.calibrated_brier_score:.3f}",
+            )
+        )
+    if risk is not None:
+        parameters["风险分层"] = {
+            "模型": risk.model,
+            "概率阈值": list(risk.thresholds),
+            "样本数": risk.n,
+            "阳性数": risk.positive,
+            "验证指标": {
+                "ROC-AUC": round(risk.roc_auc, 6),
+                "Brier score": round(risk.brier_score, 6),
+                "交叉验证折数": risk.folds,
+                "随机种子": risk.seed,
+                "数据指纹": risk.dataset_fingerprint,
+            },
+            "分档": [
+                {
+                    "档位": stratum.label,
+                    "例数": stratum.count,
+                    "占比": round(stratum.percent, 2),
+                    "实际阳性": stratum.positive,
+                    "实际阳性率": round(stratum.positive_rate, 2),
+                }
+                for stratum in risk.strata
+            ],
+            "关键风险因素": [
+                {"因素": factor.label, "贡献占比": round(factor.share, 2)}
+                for factor in risk.factors
+            ],
+            "高危人群画像": [
+                {
+                    "指标": axis.label,
+                    "高危人群": round(axis.high_rate, 2),
+                    "全样本": round(axis.overall_rate, 2),
+                }
+                for axis in risk.profile
+            ],
+        }
+        extremes = next(
+            (stratum for stratum in risk.strata if stratum.key == "critical"), None
+        )
+        if extremes is None:
+            extreme_text = "四档风险分层已完成"
+        else:
+            extreme_text = (
+                f"极高风险 {extremes.count} 例（{extremes.percent:.1f}%），"
+                f"实际阳性率 {extremes.positive_rate:.1f}%"
+            )
+        highlights.append(ReportHighlight("风险分档", extreme_text))
+    if clusters is not None:
+        results = clusters if isinstance(clusters, (tuple, list)) else (clusters,)
+        parameters["无监督分群"] = [
+            {
+                "算法": item.method,
+                "候选簇数": [run.k for run in item.runs],
+                "选定簇数": item.selected.k,
+                "轮廓系数": round(item.selected.metric.silhouette, 6),
+                "ARI（与阳性标签）": round(item.selected.metric.ari, 6),
+                "PCA解释度": [round(value, 6) for value in item.explained],
+                "各簇": [
+                    {
+                        "簇": group.label,
+                        "例数": group.count,
+                        "阳性率": round(group.positive_rate, 2),
+                        **{
+                            feature.label: round(feature.mean, 2)
+                            for feature in group.features
+                        },
+                    }
+                    for group in item.selected.groups
+                ],
+            }
+            for item in results
+        ]
+        primary = results[0]
+        first_group = primary.selected.groups[0]
+        last_group = primary.selected.groups[-1]
+        if primary.has_singletons:
+            suffix = "；出现单点簇（链式效应），不宜据此分型"
+        elif any(item.has_singletons for item in results):
+            suffix = "；另一方法出现单点簇"
+        else:
+            suffix = ""
+        highlights.append(
+            ReportHighlight(
+                "无监督分群",
+                f"{primary.method.split('（')[0]} k={primary.selected.k}："
+                f"首末簇阳性率 {first_group.positive_rate:.1f}% / {last_group.positive_rate:.1f}%"
+                + suffix,
+            )
+        )
+    if evaluation is not None:
+        parameters["分类评估"] = {
+            "验证方式": f"{evaluation.folds} 折分层交叉验证（折外概率）",
+            "判定阈值": 0.5,
+            "模型对比": [
+                {
+                    "模型": model.label,
+                    "ROC-AUC": round(model.roc_auc, 6),
+                    "PR-AUC": round(model.pr_auc, 6),
+                    "Brier": round(model.brier_score, 6),
+                    "准确率": round(model.at(0.5).accuracy, 6),
+                    "敏感度": round(model.at(0.5).sensitivity, 6),
+                    "特异度": round(model.at(0.5).specificity, 6),
+                    "F1": round(model.at(0.5).f1, 6),
+                    "MCC": round(model.at(0.5).mcc, 6),
+                }
+                for model in evaluation.models
+            ],
+        }
+        best = max(evaluation.models, key=lambda model: model.at(0.5).mcc)
+        best_metrics = best.at(0.5)
+        highlights.append(
+            ReportHighlight(
+                "分类评估",
+                f"{best.label} 综合最优：MCC {best_metrics.mcc:.3f}，"
+                f"准确率 {best_metrics.accuracy:.1%}，敏感度 {best_metrics.sensitivity:.1%}",
+            )
+        )
+    if features is not None:
+        signals = features.features
+        parameters["特征洞察"] = {
+            "方法": f"置换重要性（{features.folds} 折内打乱）+ 单变量 5 折 AUC",
+            "特征": [
+                {
+                    "特征": signal.label,
+                    "类型": "连续" if signal.kind == "numeric" else "分类",
+                    "置换重要性": round(signal.permutation, 4),
+                    "单变量AUC": round(signal.univariate_auc, 3),
+                    **(
+                        {
+                            "阳性组均值": round(signal.positive_mean, 2),
+                            "阴性组均值": round(signal.negative_mean, 2),
+                            "Cohen's d": round(signal.effect_size, 2),
+                        }
+                        if signal.kind == "numeric"
+                        else {}
+                    ),
+                }
+                for signal in signals
+            ],
+            "相关矩阵": {
+                "指标": list(features.correlation.labels),
+                "Spearman": [
+                    [round(value, 3) for value in row]
+                    for row in features.correlation.values
+                ],
+            },
+        }
+        top = signals[0]
+        strongest = max(signals, key=lambda signal: signal.univariate_auc)
+        highlights.append(
+            ReportHighlight(
+                "特征洞察",
+                f"模型最依赖「{top.label}」（置换 {top.permutation:+.3f}）；"
+                f"单变量最强「{strongest.label}」（AUC {strongest.univariate_auc:.3f}）",
+            )
+        )
     return CardioReportRecord(
         title="Cleveland 心脏风险分析报告",
-        kind_label="心脏病风险描述性分析",
+        kind_label="心脏病风险与模型评估分析",
         dataset_name=data.dataset,
         created_at=datetime.now(),
         trajectory_count=data.total_count,
         group_count=len(data.age_bands),
         metrics=metrics,
-        highlights=highlights,
-        parameters=parameters,
+        highlights=tuple(highlights),
+        parameters=_report_number(parameters),
     )
 
 
 class AIReportWorker(QObject):
-    """Runs one provider request on a background thread."""
+    """Runs the report workflow on a background thread."""
 
     completed = Signal(str)
     failed = Signal(str)
@@ -239,7 +432,7 @@ class AIReportWorker(QObject):
         record,
         provider,
         api_key: str,
-        model: str,
+        model: str | None,
         instruction: str,
     ):
         super().__init__()
@@ -249,12 +442,15 @@ class AIReportWorker(QObject):
         self.api_key = api_key
         self.model = model
         self.instruction = instruction
+        self._cancel_requested = Event()
+
+    def request_cancellation(self):
+        self._cancel_requested.set()
 
     @Slot()
     def run(self):
-        thread = QThread.currentThread()
         try:
-            kwargs = {"cancel_requested": thread.isInterruptionRequested}
+            kwargs = {"cancel_requested": self._cancel_requested.is_set}
             parameters = inspect.signature(self.service.generate).parameters
             if "progress_callback" in parameters:
                 kwargs["progress_callback"] = self.progress.emit
@@ -488,7 +684,9 @@ class AIReportDialog(QDialog):
         self.protocol_label.setText("Anthropic 最新格式" if config.protocol == "anthropic" else "OpenAI 最新兼容格式")
         self.endpoint_edit.setText(config.base_url)
         self.model_combo.clear()
-        self.model_combo.addItems(list(config.models))
+        self.model_combo.addItem("自动选择")
+        for model in config.models:
+            self.model_combo.addItem(model, model)
         self.key_edit.setText(self.service.api_key_from_env(name))
 
     def _save_security_settings(self):
@@ -547,7 +745,7 @@ class AIReportDialog(QDialog):
             self.record,
             config,
             api_key,
-            self.model_combo.currentText(),
+            self.model_combo.currentData(),
             self.instruction_edit.toPlainText(),
         )
         worker.moveToThread(thread)
@@ -569,7 +767,7 @@ class AIReportDialog(QDialog):
     def cancel_generation(self):
         if not self.is_running():
             return
-        self._thread.requestInterruption()
+        self._worker.request_cancellation()
         self.cancel_button.setEnabled(False)
         self.cancel_button.setText("正在取消…")
         self._set_status("正在取消本次请求…", "#7C8B9D")
@@ -687,6 +885,13 @@ class AIReportDialog(QDialog):
         total = max(1, int(event.get("total", 1) or 1))
         if kind == "graph_started":
             self.agent_progress_label.setText(f"正在启动主管 Agent · 共 {total} 个节点")
+            self.progress_bar.setValue(0)
+        elif kind == "wave_started":
+            wave = event.get("wave", "?")
+            agents = event.get("agents") or []
+            self.agent_progress_label.setText(
+                f"第 {wave} 波并行执行 · {len(agents)} 个节点 · {completed}/{total}"
+            )
         elif kind == "agent_started":
             self.agent_progress_label.setText(f"● 正在执行：{agent} · {completed}/{total}")
         elif kind == "agent_retry":
@@ -694,9 +899,32 @@ class AIReportDialog(QDialog):
             self.agent_progress_label.setText(f"↻ {agent} 第 {attempt} 次重试 · {completed}/{total}")
         elif kind == "agent_finished":
             status = event.get("status", "completed")
-            icon = "✓" if status == "completed" else ("△" if status == "degraded" else "✕")
+            icon = {"completed": "✓", "degraded": "△", "skipped": "跳过"}.get(status, "✕")
             self.agent_progress_label.setText(f"{icon} {agent} · {completed}/{total}")
-        self.progress_bar.setValue(min(100, int(completed * 100 / total)))
+        elif kind == "model_selected":
+            self._set_status(f"{agent} · {event['model']}", "#2B6EDE")
+        elif kind == "prompt_built":
+            self._set_status(
+                f"{agent} · 输入 {int(event.get('prompt_chars', 0)):,} 字符",
+                "#2B6EDE",
+            )
+        elif kind == "model_chunk":
+            chars = int(event.get("chars", 0) or 0)
+            self.agent_progress_label.setText(f"● {agent} 生成中 · 已接收 {chars:,} 字符")
+        elif kind == "wave_finished":
+            elapsed_ms = float(event.get("elapsed_ms", 0) or 0)
+            wave = event.get("wave", "?")
+            self.agent_progress_label.setText(
+                f"✓ 第 {wave} 波完成 · {elapsed_ms / 1000:.2f} 秒 · {completed}/{total}"
+            )
+        elif kind == "graph_finished":
+            elapsed_ms = float(event.get("elapsed_ms", 0) or 0)
+            self._set_status(
+                f"Agent 编排完成 · 总耗时 {elapsed_ms / 1000:.2f} 秒",
+                "#0B8B64",
+            )
+        percent = min(100, int(completed * 100 / total))
+        self.progress_bar.setValue(max(self.progress_bar.value(), percent))
 
     @Slot()
     def _on_thread_finished(self):

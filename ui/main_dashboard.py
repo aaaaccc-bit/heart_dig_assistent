@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QProgressBar,
+    QProgressDialog,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -39,11 +40,17 @@ from ui.dashboard_data import DashboardData
 from ui.ai_report_dialog import AIReportDialog, build_cardio_report_record
 from ui.icons import BrandMark, IconWidget, draw_icon, make_icon_pixmap
 from ui.sample_analysis import sample_stylesheet, SampleAnalysisPage
+from ui.risk_stratification import RiskStratificationPage, risk_stylesheet
+from ui.feature_insight_page import FeatureInsightPage, feature_stylesheet
 from ui.theme import COLORS, DEFAULT_FONT, rgba, theme_manager
 from algorithm.dataset import load_dataset
 from algorithm.regression import run_logistic_regression
 from algorithm.random_forest import run_random_forest
 from algorithm.neural_network import run_neural_network
+from algorithm.risk_stratification import run_risk_stratification
+from algorithm.clustering import run_clustering
+from algorithm.classification import run_classification_evaluation
+from algorithm.feature_insight import run_feature_insight
 
 
 class _ForestSignals(QObject):
@@ -63,9 +70,11 @@ class _ForestTask(QRunnable):
     @Slot()
     def run(self) -> None:
         try:
-            self.signals.finished.emit(run_random_forest(self.dataset))
+            result = run_random_forest(self.dataset)
         except Exception as error:  # noqa: BLE001 - reported on the page
-            self.signals.failed.emit(str(error) or type(error).__name__)
+            _emit_safely(self.signals.failed, str(error) or type(error).__name__)
+            return
+        _emit_safely(self.signals.finished, result)
 
 
 class _NeuralSignals(QObject):
@@ -86,11 +95,149 @@ class _NeuralTask(QRunnable):
     @Slot()
     def run(self) -> None:
         try:
-            self.signals.finished.emit(
-                run_neural_network(self.dataset, hidden_layer_sizes=self.hidden_layer_sizes)
+            result = run_neural_network(self.dataset, hidden_layer_sizes=self.hidden_layer_sizes)
+        except Exception as error:  # noqa: BLE001 - reported on the page
+            _emit_safely(self.signals.failed, str(error) or type(error).__name__)
+            return
+        _emit_safely(self.signals.finished, result)
+
+
+class _ClassificationSignals(QObject):
+    finished = Signal(object)
+    failed = Signal(str)
+
+
+def _emit_safely(signal, *args) -> None:
+    """Emit from a worker thread, ignoring a window that closed meanwhile."""
+
+    try:
+        signal.emit(*args)
+    except RuntimeError:
+        pass
+
+
+class _ClassificationTask(QRunnable):
+    """Run the head-to-head classification evaluation off the Qt UI thread."""
+
+    def __init__(self, dataset, signals: _ClassificationSignals) -> None:
+        super().__init__()
+        self.dataset = dataset
+        self.signals = signals
+        self.setAutoDelete(True)
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            result = run_classification_evaluation(self.dataset)
+        except Exception as error:  # noqa: BLE001 - reported on the page
+            _emit_safely(self.signals.failed, str(error) or type(error).__name__)
+            return
+        _emit_safely(self.signals.finished, result)
+
+
+class _FeatureSignals(QObject):
+    finished = Signal(int, object)
+    failed = Signal(int, str)
+
+
+class _FeatureTask(QRunnable):
+    """Run the feature-insight analysis off the Qt UI thread."""
+
+    def __init__(self, dataset, signals: _FeatureSignals, generation: int) -> None:
+        super().__init__()
+        self.dataset = dataset
+        self.signals = signals
+        self.generation = generation
+        self.setAutoDelete(True)
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            result = run_feature_insight(self.dataset)
+        except Exception as error:  # noqa: BLE001 - reported on the page
+            _emit_safely(self.signals.failed, self.generation, str(error) or type(error).__name__)
+            return
+        _emit_safely(self.signals.finished, self.generation, result)
+
+
+class _ReportContextSignals(QObject):
+    finished = Signal(object)
+    failed = Signal(str)
+
+
+class _ReportContextTask(QRunnable):
+    """Compute the analyses a report needs but the current session lacks.
+
+    The fits run sequentially: they are all CPU-bound and share the same small
+    dataset, so running them on a thread pool only adds contention (measured
+    slower than the sequential path on the development machine).
+    """
+
+    def __init__(self, dataset, need: frozenset[str], signals: _ReportContextSignals) -> None:
+        super().__init__()
+        self.dataset = dataset
+        self.need = need
+        self.signals = signals
+        self.setAutoDelete(True)
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            payload: dict = {"dataset": self.dataset}
+            if "sample" in self.need:
+                payload["regression"] = run_logistic_regression(
+                    self.dataset, predictors=("cp", "oldpeak")
+                )
+                payload["forest"] = run_random_forest(self.dataset)
+            if "evaluation" in self.need:
+                payload["evaluation"] = run_classification_evaluation(self.dataset)
+            if "risk" in self.need:
+                payload["risk"] = run_risk_stratification(self.dataset)
+                clusters = []
+                for method in ("kmeans", "single"):
+                    try:
+                        clusters.append(run_clustering(self.dataset, method=method))
+                    except Exception:  # noqa: BLE001 - one method may not fit
+                        continue
+                payload["clusters"] = tuple(clusters)
+            if "features" in self.need:
+                payload["features"] = run_feature_insight(self.dataset)
+        except Exception as error:  # noqa: BLE001 - surfaced as a toast
+            _emit_safely(self.signals.failed, str(error) or type(error).__name__)
+            return
+        _emit_safely(self.signals.finished, payload)
+
+
+class _RiskSignals(QObject):
+    finished = Signal(int, object)
+    failed = Signal(int, str)
+
+
+class _RiskTask(QRunnable):
+    """Run the risk-stratification analysis off the Qt UI thread."""
+
+    def __init__(self, dataset, signals: _RiskSignals, generation: int) -> None:
+        super().__init__()
+        self.dataset = dataset
+        self.signals = signals
+        self.generation = generation
+        self.setAutoDelete(True)
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            risk = run_risk_stratification(self.dataset)
+            clusters = []
+            for method in ("kmeans", "single"):
+                try:
+                    clusters.append(run_clustering(self.dataset, method=method))
+                except Exception:  # noqa: BLE001 - one method may not fit
+                    continue
+            _emit_safely(
+                self.signals.finished, self.generation, (risk, tuple(clusters))
             )
         except Exception as error:  # noqa: BLE001 - reported on the page
-            self.signals.failed.emit(str(error) or type(error).__name__)
+            _emit_safely(self.signals.failed, self.generation, str(error) or type(error).__name__)
 
 NAV_WORKSPACE = (
     ("工作台", "grid"),
@@ -529,6 +676,8 @@ class KpiCard(QFrame):
 class ChartCard(QFrame):
     """Age-band sample volume versus positive cases."""
 
+    stratify_requested = Signal()
+
     def __init__(self, data: DashboardData, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("dbCard")
@@ -555,7 +704,7 @@ class ChartCard(QFrame):
         chip.setIcon(make_icon_pixmap("chevron-right", 12, COLORS["primary"]))
         chip.setIconSize(QSize(12, 12))
         chip.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
-        chip.clicked.connect(lambda: _coming_soon(self, "分层筛选"))
+        chip.clicked.connect(self.stratify_requested.emit)
         head.addWidget(chip, 0, Qt.AlignmentFlag.AlignVCenter)
         layout.addLayout(head)
 
@@ -860,8 +1009,22 @@ class MainDashboard(QWidget):
         self._sample_regression_result = None
         self._sample_forest_result = None
         self._sample_neural_result = None
+        self._sample_classification_result = None
+        self._classification_loading = False
         self._sample_page = None
         self._sample_dataset = None
+        self._risk_result = None
+        self._cluster_result = None
+        self._risk_page = None
+        self._risk_requested = False
+        self._risk_loading = False
+        self._risk_generation = 0
+        self._feature_result = None
+        self._feature_page = None
+        self._feature_requested = False
+        self._feature_loading = False
+        self._feature_generation = 0
+        self._report_preparing = False
 
         self.setObjectName("dbRoot")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
@@ -918,6 +1081,25 @@ class MainDashboard(QWidget):
         self.nav.set_data(data)
         self.topbar.set_data(data)
         self.topbar.set_compact(False)
+        self._risk_result = None
+        self._cluster_result = None
+        self._risk_requested = False
+        self._risk_loading = False
+        self._risk_generation += 1
+        self._feature_result = None
+        self._feature_requested = False
+        self._feature_loading = False
+        self._feature_generation += 1
+        # Every model result is keyed by the dataset that produced it; a new
+        # dataset invalidates all of them, including the report context.
+        self._sample_regression_result = None
+        self._sample_forest_result = None
+        self._sample_neural_result = None
+        self._sample_classification_result = None
+        self._sample_page = None
+        self._sample_dataset = None
+        self._classification_loading = False
+        self._report_preparing = False
         self._replace_content(self._dashboard_content())
 
     def show_empty(self, message: str = "") -> None:
@@ -1116,7 +1298,9 @@ class MainDashboard(QWidget):
         row = QHBoxLayout(holder)
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(16)
-        row.addWidget(ChartCard(self.data), 1)
+        chart = ChartCard(self.data)
+        chart.stratify_requested.connect(self._show_risk_stratification)
+        row.addWidget(chart, 1)
 
         side = QWidget()
         side.setFixedWidth(408)
@@ -1154,6 +1338,10 @@ class MainDashboard(QWidget):
         self.topbar.avatar.setToolTip(f"当前账号：{account}")
 
     def _on_navigate(self, name: str) -> None:
+        if name != "风险分层":
+            self._risk_requested = False
+        if name != "特征洞察":
+            self._feature_requested = False
         if name == "工作台":
             self.nav.set_active(name)
             self.topbar.set_compact(False)
@@ -1162,6 +1350,12 @@ class MainDashboard(QWidget):
             return
         if name == "样本分析":
             self._show_sample_analysis()
+            return
+        if name == "风险分层":
+            self._show_risk_stratification()
+            return
+        if name == "特征洞察":
+            self._show_feature_insight()
             return
         if name == "数据导入":
             self.nav.set_active("工作台")
@@ -1185,6 +1379,7 @@ class MainDashboard(QWidget):
                 self._sample_regression_result,
                 self._sample_forest_result,
                 self._sample_neural_result,
+                self._sample_classification_result,
             )
             return
 
@@ -1201,8 +1396,9 @@ class MainDashboard(QWidget):
         self._sample_regression_result = result
         self._sample_forest_result = None
         self._sample_neural_result = None
+        self._sample_classification_result = None
         self._sample_dataset = dataset
-        self._render_sample_analysis(dataset, result, None, None)
+        self._render_sample_analysis(dataset, result, None, None, None)
 
     def _render_sample_analysis(
         self,
@@ -1210,19 +1406,22 @@ class MainDashboard(QWidget):
         result,
         forest_result,
         neural_result,
+        classification_result=None,
     ) -> None:
         self.nav.set_active("样本分析")
         self.topbar.set_compact(True)
         self.topbar.title_label.setText("回归分析")
         self.topbar.subtitle_label.setText("")
-        page = SampleAnalysisPage(result, forest_result, neural_result)
+        page = SampleAnalysisPage(result, forest_result, neural_result, classification_result)
         self._sample_page = page
         self._sample_regression_result = result
         self._sample_forest_result = forest_result
         self._sample_neural_result = neural_result
+        self._sample_classification_result = classification_result
         self._sample_dataset = dataset
         page.regression_changed.connect(self._set_sample_regression_result)
         page.neural_structure_requested.connect(self._rerun_neural_network)
+        page.evaluation_requested.connect(lambda: self._start_classification_task(dataset, page))
         page.setStyleSheet(sample_stylesheet())
         self._replace_content(page)
 
@@ -1235,6 +1434,39 @@ class MainDashboard(QWidget):
             QThreadPool.globalInstance().start(task)
         if neural_result is None:
             self._start_neural_task(dataset, page, (32, 16))
+
+    def _start_classification_task(self, dataset, page: SampleAnalysisPage) -> None:
+        """Lazily evaluate the three models the first time the tab is opened."""
+
+        if self._sample_classification_result is not None:
+            # The page was built with the cached result, nothing to do.
+            return
+        if self._classification_loading:
+            return
+        self._classification_loading = True
+        signals = _ClassificationSignals(self)
+        signals.finished.connect(self._set_sample_classification_result)
+        signals.failed.connect(lambda error: self._classification_failed(page, error))
+        QThreadPool.globalInstance().start(_ClassificationTask(dataset, signals))
+
+    def _set_sample_classification_result(self, result) -> None:
+        self._classification_loading = False
+        self._sample_classification_result = result
+        page = self._sample_page
+        if page is None:
+            return
+        try:
+            page.set_evaluation_result(result)
+        except RuntimeError:
+            # The page was destroyed while the task was running.
+            self._sample_page = None
+
+    def _classification_failed(self, page, error: str) -> None:
+        self._classification_loading = False
+        try:
+            page.set_evaluation_result(None, error)
+        except RuntimeError:
+            pass
 
     def _start_neural_task(
         self,
@@ -1264,13 +1496,276 @@ class MainDashboard(QWidget):
     def _set_sample_neural_result(self, result) -> None:
         self._sample_neural_result = result
 
-    def _open_ai_report(self) -> None:
-        """Open the provider dialog with the current dashboard results."""
+    def _show_risk_stratification(self) -> None:
+        """Render the 风险分层 page, recomputing only when no result is cached."""
 
+        self.nav.set_active("风险分层")
+        self.topbar.set_compact(True)
+        self.topbar.title_label.setText("风险分层")
+        self.topbar.subtitle_label.setText("基于 Cleveland 数据集 · 逻辑回归 + 随机森林 融合模型")
+        self._risk_requested = True
+
+        if self._risk_result is not None:
+            self._render_risk_stratification(self._risk_result, self._cluster_result)
+            self._risk_requested = False
+            return
+
+        self._replace_content(
+            self._placeholder_content(
+                icon="pulse",
+                title="正在计算风险分层",
+                detail="融合逻辑回归与随机森林的交叉验证概率，并汇总分档、贡献度与人群画像…",
+                accent=COLORS["primary"],
+                busy=True,
+            )
+        )
+        if self._risk_loading:
+            return
+        try:
+            dataset = load_dataset()
+        except Exception as exc:  # pragma: no cover - defensive UI fallback
+            self._risk_requested = False
+            self._replace_content(
+                self._placeholder_content(
+                    icon="file-text",
+                    title="风险分层暂不可用",
+                    detail=str(exc),
+                    accent=COLORS["danger"],
+                )
+            )
+            return
+        self._risk_loading = True
+        self._risk_generation += 1
+        generation = self._risk_generation
+        signals = _RiskSignals(self)
+        signals.finished.connect(self._set_risk_result)
+        signals.failed.connect(self._risk_failed)
+        QThreadPool.globalInstance().start(_RiskTask(dataset, signals, generation))
+
+    def _render_risk_stratification(self, result, clusters) -> None:
+        page = RiskStratificationPage(result, clusters)
+        page.report_requested.connect(self._open_ai_report)
+        page.setStyleSheet(risk_stylesheet())
+        self._risk_page = page
+        self._replace_content(page)
+
+    def _set_risk_result(self, generation: int, payload) -> None:
+        if generation != self._risk_generation:
+            return
+        self._risk_loading = False
+        if not self._risk_requested:
+            return
+        result, clusters = payload
+        self._risk_result = result
+        self._cluster_result = clusters
+        self._risk_requested = False
+        self._render_risk_stratification(result, clusters)
+
+    def _risk_failed(self, generation: int, error: str) -> None:
+        if generation != self._risk_generation:
+            return
+        self._risk_loading = False
+        if not self._risk_requested:
+            return
+        self._risk_requested = False
+        self._replace_content(
+            self._placeholder_content(
+                icon="file-text",
+                title="风险分层暂不可用",
+                detail=error,
+                accent=COLORS["danger"],
+            )
+        )
+
+    def _show_feature_insight(self) -> None:
+        """Render the 特征洞察 page, computing it once per dataset."""
+
+        self.nav.set_active("特征洞察")
+        self.topbar.set_compact(True)
+        self.topbar.title_label.setText("特征洞察")
+        self.topbar.subtitle_label.setText("13 个临床特征 · 模型依赖度与单变量判别力")
+        self._feature_requested = True
+
+        if self._feature_result is not None:
+            self._render_feature_insight(self._feature_result)
+            self._feature_requested = False
+            return
+
+        self._replace_content(
+            self._placeholder_content(
+                icon="chart",
+                title="正在计算特征洞察",
+                detail="逐折打乱特征估计模型依赖度，并单独评估每个特征的判别力…",
+                accent=COLORS["primary"],
+                busy=True,
+            )
+        )
+        if self._feature_loading:
+            return
+        try:
+            dataset = load_dataset()
+        except Exception as exc:  # pragma: no cover - defensive UI fallback
+            self._feature_requested = False
+            self._replace_content(
+                self._placeholder_content(
+                    icon="file-text",
+                    title="特征洞察暂不可用",
+                    detail=str(exc),
+                    accent=COLORS["danger"],
+                )
+            )
+            return
+        self._feature_loading = True
+        self._feature_generation += 1
+        generation = self._feature_generation
+        signals = _FeatureSignals(self)
+        signals.finished.connect(self._set_feature_result)
+        signals.failed.connect(self._feature_failed)
+        QThreadPool.globalInstance().start(_FeatureTask(dataset, signals, generation))
+
+    def _render_feature_insight(self, result) -> None:
+        page = FeatureInsightPage(result)
+        page.setStyleSheet(feature_stylesheet())
+        self._feature_page = page
+        self._replace_content(page)
+
+    def _set_feature_result(self, generation: int, result) -> None:
+        if generation != self._feature_generation:
+            return
+        self._feature_loading = False
+        if not self._feature_requested:
+            return
+        self._feature_result = result
+        self._feature_requested = False
+        self._render_feature_insight(result)
+
+    def _feature_failed(self, generation: int, error: str) -> None:
+        if generation != self._feature_generation:
+            return
+        self._feature_loading = False
+        if not self._feature_requested:
+            return
+        self._feature_requested = False
+        self._replace_content(
+            self._placeholder_content(
+                icon="file-text",
+                title="特征洞察暂不可用",
+                detail=error,
+                accent=COLORS["danger"],
+            )
+        )
+
+    def _open_ai_report(self) -> None:
+        """Open the provider dialog once every report section is available."""
+
+        if self._report_preparing:
+            return
+        missing = self._missing_report_inputs()
+        if not missing:
+            self._show_report_dialog()
+            return
+        self._prepare_report(missing)
+
+    def _missing_report_inputs(self) -> tuple[str, ...]:
+        """Which analysis groups are still missing from the report context."""
+
+        missing = []
+        if self._sample_regression_result is None or self._sample_forest_result is None:
+            missing.append("sample")
+        if self._sample_classification_result is None:
+            missing.append("evaluation")
+        if self._risk_result is None or not self._cluster_result:
+            missing.append("risk")
+        if self._feature_result is None:
+            missing.append("features")
+        return tuple(missing)
+
+    def _prepare_report(self, missing: tuple[str, ...]) -> None:
+        dataset = self._sample_dataset
+        if dataset is None:
+            try:
+                dataset = load_dataset()
+            except Exception as exc:  # pragma: no cover - defensive UI fallback
+                self.show_toast(f"无法读取数据集：{exc}")
+                return
+
+        progress = QProgressDialog("正在汇总模型、分层与特征结果…", "跳过等待", 0, 0, self)
+        progress.setWindowTitle("准备分析报告")
+        progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+        progress.setMinimumDuration(0)
+        progress.setMinimumWidth(380)
+        progress.show()
+        self._report_preparing = True
+        state = {"closed": False}
+
+        def close_progress() -> None:
+            if not state["closed"]:
+                state["closed"] = True
+                progress.close()
+                progress.deleteLater()
+
+        signals = _ReportContextSignals(self)
+
+        def finish(payload) -> None:
+            self._report_preparing = False
+            self._store_report_context(payload)
+            if state["closed"]:
+                return
+            close_progress()
+            self._show_report_dialog()
+
+        def fail(error: str) -> None:
+            self._report_preparing = False
+            if state["closed"]:
+                return
+            close_progress()
+            self.show_toast(f"汇总分析结果失败：{error}")
+
+        def skip() -> None:
+            if state["closed"]:
+                return
+            self._report_preparing = False
+            close_progress()
+            self.show_toast("已跳过等待；报告只包含当前已完成的分析")
+            self._show_report_dialog()
+
+        signals.finished.connect(finish)
+        signals.failed.connect(fail)
+        progress.canceled.connect(skip)
+        cancel_button = progress.findChild(QPushButton)
+        if cancel_button is not None:
+            # QProgressDialog.cancel() does not always emit ``canceled`` when
+            # called programmatically, so the button is wired directly.
+            cancel_button.clicked.connect(skip)
+        QThreadPool.globalInstance().start(
+            _ReportContextTask(dataset, frozenset(missing), signals)
+        )
+
+    def _store_report_context(self, payload: dict) -> None:
+        if "dataset" in payload:
+            self._sample_dataset = payload["dataset"]
+        if "regression" in payload:
+            self._sample_regression_result = payload["regression"]
+        if "forest" in payload:
+            self._sample_forest_result = payload["forest"]
+        if "evaluation" in payload:
+            self._sample_classification_result = payload["evaluation"]
+        if "risk" in payload:
+            self._risk_result = payload["risk"]
+        if "clusters" in payload:
+            self._cluster_result = payload["clusters"]
+        if "features" in payload:
+            self._feature_result = payload["features"]
+
+    def _show_report_dialog(self) -> None:
         record = build_cardio_report_record(
             self.data,
             self._sample_regression_result,
             self._sample_forest_result,
+            self._risk_result,
+            self._cluster_result,
+            self._sample_classification_result,
+            self._feature_result,
         )
         AIReportDialog(record, self).exec()
 

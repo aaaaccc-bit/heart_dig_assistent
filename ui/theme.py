@@ -45,6 +45,11 @@ LIGHT_COLORS = {
     "disabled_text": "#A9B6C3",
     "toast": "#0B1F3A",
     "nav_section": "#8CA5C8",
+    # ordered risk bands: low -> critical (also used by the stratification page)
+    "risk_low": "#1FA97E",
+    "risk_medium": "#E0B23C",
+    "risk_high": "#F0873F",
+    "risk_critical": "#E05252",
 }
 
 DARK_COLORS = {
@@ -80,6 +85,10 @@ DARK_COLORS = {
     "disabled_text": "#7F92A8",
     "toast": "#07182F",
     "nav_section": "#9BB5D7",
+    "risk_low": "#47D3A6",
+    "risk_medium": "#F2C860",
+    "risk_high": "#FF9C5C",
+    "risk_critical": "#FF7F88",
 }
 
 COLORS = dict(LIGHT_COLORS)

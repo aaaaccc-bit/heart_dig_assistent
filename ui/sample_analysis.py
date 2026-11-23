@@ -21,11 +21,13 @@ from PySide6.QtWidgets import (
 )
 
 from algorithm.dataset import load_dataset
+from algorithm.classification import ClassificationEvaluation
 from algorithm.regression import RegressionError, RegressionResult, run_logistic_regression
 from algorithm.random_forest import RandomForestError, RandomForestResult, run_random_forest
 from algorithm.neural_network import ClassificationMetrics, NeuralNetworkResult
 from sklearn.calibration import calibration_curve
 from sklearn.metrics import roc_curve
+from ui.classification_page import ClassificationEvaluationPage
 from ui.icons import make_icon_pixmap
 from ui.theme import COLORS, rgba
 
@@ -300,6 +302,7 @@ class SampleSubNav(QFrame):
             ("regression", "回归分析", "chart"),
             ("neural", "神经网络分析", "sparkles"),
             ("forest", "随机森林分析", "grid"),
+            ("evaluation", "分类评估", "gauge"),
         ):
             button = QPushButton(text)
             button.setObjectName("sampleSubButton")
@@ -741,67 +744,120 @@ class NeuralNetworkAnalysisPage(QWidget):
         return holder
 
 class SampleAnalysisPage(QWidget):
-    """Sample-analysis shell with regression, neural-network and forest tabs."""
+    """Sample-analysis shell with regression, neural-network, forest and evaluation tabs."""
 
     regression_changed = Signal(object)
     neural_structure_requested = Signal(tuple)
+    evaluation_requested = Signal()
 
-    def __init__(self, result: RegressionResult, forest_result: RandomForestResult | None = None, neural_result: NeuralNetworkResult | None = None, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        result: RegressionResult,
+        forest_result: RandomForestResult | None = None,
+        neural_result: NeuralNetworkResult | None = None,
+        evaluation_result: ClassificationEvaluation | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
-        self.setMinimumSize(1280, 980)
+        self.setMinimumSize(1120, 940)
         layout = QHBoxLayout(self)
         layout.setContentsMargins(24, 24, 24, 24)
         layout.setSpacing(16)
         self.subnav = SampleSubNav()
         layout.addWidget(self.subnav)
         self.stack = QStackedWidget()
+        self._indices: dict[str, int] = {}
         self._neural_page: NeuralNetworkAnalysisPage | None = None
+
         self._set_regression_page(result)
+
         if neural_result is None:
             self._neural_placeholder = self._placeholder("神经网络分析", "正在准备多层感知机分析…")
-            self.stack.addWidget(self._neural_placeholder)
+            self._indices["neural"] = self.stack.addWidget(self._neural_placeholder)
         else:
             self._neural_placeholder = None
             neural_page = NeuralNetworkAnalysisPage(neural_result)
             self._connect_neural_page(neural_page)
-            self.stack.addWidget(neural_page)
+            self._indices["neural"] = self.stack.addWidget(neural_page)
+
         if forest_result is None:
             self._forest_placeholder = self._placeholder("随机森林分析", "正在准备随机森林分析…")
-            self.stack.addWidget(self._forest_placeholder)
+            self._indices["forest"] = self.stack.addWidget(self._forest_placeholder)
         else:
             self._forest_placeholder = None
-            self.stack.addWidget(RandomForestAnalysisPage(forest_result))
-        self.subnav.changed.connect(
-            lambda key: self.stack.setCurrentIndex({"regression": 0, "neural": 1, "forest": 2}[key])
-        )
+            self._indices["forest"] = self.stack.addWidget(RandomForestAnalysisPage(forest_result))
+
+        if evaluation_result is None:
+            self._evaluation_placeholder = self._placeholder(
+                "分类评估", "正在同一份折外概率上对照三个模型…"
+            )
+            self._indices["evaluation"] = self.stack.addWidget(self._evaluation_placeholder)
+        else:
+            self._evaluation_placeholder = None
+            self._indices["evaluation"] = self.stack.addWidget(
+                ClassificationEvaluationPage(evaluation_result)
+            )
+
+        self.subnav.changed.connect(self._on_subnav)
+        self.stack.setCurrentIndex(self._indices["regression"])
         layout.addWidget(self.stack, 1)
+
+    def _on_subnav(self, key: str) -> None:
+        index = self._indices.get(key)
+        if index is None:
+            return
+        self.stack.setCurrentIndex(index)
+        if key == "evaluation":
+            self.evaluation_requested.emit()
+
+    def _replace_tab(self, key: str, page: QWidget) -> None:
+        index = self._indices[key]
+        was_current = self.stack.currentIndex() == index
+        old = self.stack.widget(index)
+        if old is not None:
+            self.stack.removeWidget(old)
+            old.deleteLater()
+        self.stack.insertWidget(index, page)
+        if was_current:
+            # removeWidget() moves the stack to another page, so restoring the
+            # index is what keeps the user on the tab they are looking at.
+            self.stack.setCurrentIndex(index)
 
     def set_forest_result(self, result: RandomForestResult | None, error: str = "") -> None:
         """Replace the forest placeholder after the background analysis finishes."""
 
-        if self.stack.count() < 3:
-            return
-        page = RandomForestAnalysisPage(result) if result is not None else self._placeholder("随机森林分析暂不可用", error or "请稍后重试。")
-        old = self.stack.widget(2)
-        self.stack.removeWidget(old)
-        old.deleteLater()
-        self.stack.insertWidget(2, page)
+        page = (
+            RandomForestAnalysisPage(result)
+            if result is not None
+            else self._placeholder("随机森林分析暂不可用", error or "请稍后重试。")
+        )
+        self._replace_tab("forest", page)
         self._forest_placeholder = None
 
     def set_neural_result(self, result: NeuralNetworkResult | None, error: str = "") -> None:
         """Replace the neural-network placeholder after the background analysis finishes."""
 
-        if self.stack.count() < 3:
-            return
-        page = NeuralNetworkAnalysisPage(result) if result is not None else self._placeholder("神经网络分析暂不可用", error or "请稍后重试。")
-        old = self.stack.widget(1)
-        self.stack.removeWidget(old)
-        old.deleteLater()
-        self.stack.insertWidget(1, page)
+        page = (
+            NeuralNetworkAnalysisPage(result)
+            if result is not None
+            else self._placeholder("神经网络分析暂不可用", error or "请稍后重试。")
+        )
+        self._replace_tab("neural", page)
         self._neural_page = page if isinstance(page, NeuralNetworkAnalysisPage) else None
         if self._neural_page is not None:
             self._connect_neural_page(self._neural_page)
         self._neural_placeholder = None
+
+    def set_evaluation_result(self, result: ClassificationEvaluation | None, error: str = "") -> None:
+        """Replace the classification-evaluation placeholder when the task finishes."""
+
+        page = (
+            ClassificationEvaluationPage(result)
+            if result is not None
+            else self._placeholder("分类评估暂不可用", error or "请稍后重试。")
+        )
+        self._replace_tab("evaluation", page)
+        self._evaluation_placeholder = None
 
     def set_neural_loading(self, structure: tuple[int, ...]) -> None:
         if self._neural_page is not None:
@@ -814,14 +870,11 @@ class SampleAnalysisPage(QWidget):
     def _set_regression_page(self, result: RegressionResult) -> None:
         page = RegressionAnalysisPage(result)
         page.result_requested.connect(self._run_regression)
-        if self.stack.count() == 0:
-            self.stack.addWidget(page)
+        if "regression" not in self._indices:
+            self._indices["regression"] = self.stack.addWidget(page)
         else:
-            old = self.stack.widget(0)
-            self.stack.removeWidget(old)
-            old.deleteLater()
-            self.stack.insertWidget(0, page)
-        self.stack.setCurrentIndex(0)
+            self._replace_tab("regression", page)
+        self.stack.setCurrentIndex(self._indices["regression"])
 
     def _run_regression(self, predictors: tuple[str, ...]) -> None:
         try:
