@@ -7,10 +7,11 @@ DataFrame and the algorithms never import Qt.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from algorithm import WorkbenchPayload, build_workbench_from_csv
+from algorithm import WorkbenchPayload, build_workbench
+from algorithm.dataset import Dataset, load_dataset
 from algorithm.schema import REQUIRED_COLUMNS
 from algorithm.stats import format_number
 from ui.theme import COLORS, rgba
@@ -113,6 +114,7 @@ class DashboardData:
     positive_note: str = ""
     target_positive: str = ""
     source_tooltip: str = ""
+    analysis_dataset: Dataset | None = field(default=None, compare=False, repr=False)
 
 
 #: Icon, colour and tint for each KPI key returned by the algorithm.
@@ -358,11 +360,10 @@ def load_dashboard(
 ) -> DashboardData:
     """Load the default (or given) CSV and adapt it for the workbench."""
 
-    payload = (
-        build_workbench_from_csv(path) if path is not None else build_workbench_from_csv()
-    )
-    return to_dashboard(
-        payload,
+    dataset = load_dataset(path) if path is not None else load_dataset()
+    data = to_dashboard(
+        build_workbench(dataset),
         dataset_name=dataset_name,
         dataset_source=str(path) if path is not None else "",
     )
+    return replace(data, analysis_dataset=dataset)

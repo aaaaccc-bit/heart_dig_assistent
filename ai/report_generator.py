@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import urllib.error
+from urllib.parse import urlencode
 import urllib.request
 from collections.abc import Mapping
 from datetime import datetime
@@ -15,7 +16,8 @@ from uuid import uuid4
 
 from .artifacts import AgentArtifact
 from .memory import LongTermMemory, get_shared_memory
-from .providers import ProviderConfig
+from .provider_settings import report_key_from_env, report_model_key
+from .providers import ProviderConfig, cancellable_request_opener, open_custom_request
 from .knowledge_base import ChineseKnowledgeBase, get_shared_knowledge_base
 from .report_guard import finalize_report
 from .review_agents import (
@@ -40,6 +42,7 @@ from .orchestrator import (
 _READ_CHUNK = 4096
 _MAX_PROMPT_LIST_ITEMS = 20
 _MAX_PROMPT_TEXT_CHARS = 1600
+_OUTPUT_LIMIT_REASONS = {"length", "max_tokens", "model_context_window_exceeded", "context_length_exceeded"}
 
 
 class AIReportError(RuntimeError):
@@ -168,7 +171,7 @@ class AIReportService:
         return (
             f"{extra}{format_instruction}{knowledge_block}"
             "\n\n以下是结构化分析结果（当前实验的唯一数据来源）：\n"
-            f"{json.dumps(payload, ensure_ascii=False, indent=2)}"
+            f"{json.dumps(payload, ensure_ascii=False, separators=(",", ":"))}"
         )
 
     def _get_knowledge_base(self) -> ChineseKnowledgeBase:
@@ -241,8 +244,10 @@ class AIReportService:
         safety_mode = safety_mode or str(security["mode"])
         safety_strength = security["strength"] if safety_strength is None else safety_strength
         key = (api_key or "").strip()
-        if not key:
-            raise AIReportError("请先填写 API Key，或在环境变量中配置对应密钥。")
+        try:
+            provider.request_headers(key)
+        except ValueError as exc:
+            raise AIReportError(str(exc)) from exc
         state = None
         try:
             state = self._run_orchestration(
@@ -280,7 +285,7 @@ class AIReportService:
                 + json.dumps(
                     self._compact_evidence(state.evidence),
                     ensure_ascii=False,
-                    indent=2,
+                    separators=(",", ":"),
                 )
             )
         if state.memory_context:
@@ -289,7 +294,7 @@ class AIReportService:
         if review_outputs:
             prompt += (
                 "\n\n审查 Agent 结果（必须遵守其中的警告和后续动作）：\n"
-                + json.dumps(review_outputs, ensure_ascii=False, indent=2)
+                + json.dumps(review_outputs, ensure_ascii=False, separators=(",", ":"))
             )
         return prompt
 
@@ -322,8 +327,6 @@ class AIReportService:
                 "stream": True,
                 "messages": [{"role": "user", "content": prompt}],
             }
-            headers = {"x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"}
-            url = provider.base_url.rstrip("/") + "/messages"
         else:
             payload = {
                 "model": model,
@@ -337,25 +340,42 @@ class AIReportService:
                     {"role": "user", "content": prompt},
                 ],
             }
-            headers = {"Authorization": f"Bearer {key}", "content-type": "application/json"}
-            url = provider.base_url.rstrip("/") + "/chat/completions"
-        request = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
+        request = urllib.request.Request(
+            provider.endpoint, data=json.dumps(payload).encode("utf-8"),
+            headers=provider.request_headers(key), method="POST",
+        )
+        phase = "等待响应"
+        state.report_progress(kind="model_waiting", agent=agent)
+        state.check_cancelled()
+        if state.cancel_requested is not None:
+            open_request = cancellable_request_opener(
+                check_cancelled=state.check_cancelled, no_redirect=provider.uses_user_endpoint,
+            )
+        else:
+            open_request = open_custom_request if provider.uses_user_endpoint else urllib.request.urlopen
         try:
-            with urllib.request.urlopen(request, timeout=self.connect_timeout) as response:
+            try:
+                response = open_request(request, timeout=self.connect_timeout)
+            except urllib.error.HTTPError as exc:
+                with exc:
+                    state.check_cancelled()
+                    try:
+                        detail = exc.read(2048).decode("utf-8", errors="replace")
+                    except (OSError, HTTPException, ValueError):
+                        detail = ""
+                state.check_cancelled()
+                hint = self._http_error_hint(exc.code, detail)
+                raise AIReportError(f"{provider.name} 请求失败（HTTP {exc.code}）。{hint}") from exc
+            with response:
+                state.check_cancelled()
+                phase = "读取响应"
                 self._set_read_timeout(response, self.read_timeout)
-                streamed, body = self._read_response(
-                    response,
-                    state,
-                    provider.protocol,
-                    agent=agent,
-                )
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")[:500]
-            raise AIReportError(f"{provider.name} API 请求失败（HTTP {exc.code}）：{detail}") from exc
-        except TimeoutError as exc:
-            raise AIReportError(f"{provider.name} API 请求超时：{exc}") from exc
+                streamed, body = self._read_response(response, state, provider.protocol, agent=agent)
         except (urllib.error.URLError, OSError, HTTPException) as exc:
-            raise AIReportError(f"无法连接 {provider.name} API：{exc}") from exc
+            state.check_cancelled()
+            if isinstance(exc, TimeoutError) or isinstance(getattr(exc, "reason", None), TimeoutError):
+                raise AIReportError(f"{phase}超时。请检查 {provider.name} 的响应速度和网络连接。") from exc
+            raise AIReportError(f"{phase}时连接中断。请检查 {provider.name} 的服务状态和网络连接。") from exc
         state.check_cancelled()
         if streamed:
             return self._normalize_markdown(body)
@@ -363,7 +383,53 @@ class AIReportService:
             data = json.loads(body.decode("utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             raise AIReportError("API 返回内容不是有效 JSON。") from exc
-        return self._normalize_markdown(self._extract_text(data, provider.protocol))
+        if not isinstance(data, Mapping):
+            raise AIReportError("API 返回的报告格式无效。")
+        self._check_report_response(data, provider.protocol)
+        text = self._normalize_markdown(self._extract_text(data, provider.protocol))
+        if not text:
+            raise AIReportError("API 响应未包含报告文本。请检查所选模型的输出设置。")
+        return text
+
+    @staticmethod
+    def _is_context_error(detail: str) -> bool:
+        lowered = detail.lower()
+        return any(marker in lowered for marker in (
+            "context_length_exceeded", "context_window_exceeded", "maximum context length",
+            "exceeds the available context size", "context window is too small", "prompt is too long",
+        ))
+
+    @classmethod
+    def _http_error_hint(cls, code: int, detail: str = "") -> str:
+        if code in {400, 413, 422} and cls._is_context_error(detail):
+            return "报告输入超出了模型的上下文上限。请增大模型上下文或减少报告输入。"
+        return {
+            401: "请核对 API Key。",
+            403: "请检查 API Key 的模型访问权限。",
+            404: "请核对接口地址和模型 ID。",
+            413: "请求体超过服务允许的大小。请减少报告输入。",
+            429: "API 当前限流或额度不足，请检查服务配额。",
+            502: "网关未收到上游模型的有效响应。请检查供应商的服务状态。",
+            503: "模型服务暂时不可用。请稍后重试。",
+            504: "网关等待上游模型超时。请检查供应商的服务状态。",
+        }.get(code, "请检查接口配置与服务状态。")
+
+    @classmethod
+    def _check_report_response(cls, data: Mapping[str, Any], protocol: str) -> None:
+        error = data.get("error")
+        if error or data.get("type") == "error":
+            if cls._is_context_error(str(error)):
+                raise AIReportError(cls._http_error_hint(400, str(error)))
+            raise AIReportError("模型服务在返回报告时出错。请检查供应商的服务状态。")
+        if protocol == "anthropic":
+            delta = data.get("delta")
+            reason = data.get("stop_reason") or (delta.get("stop_reason") if isinstance(delta, Mapping) else None)
+        else:
+            choices = data.get("choices") or []
+            choice = choices[0] if isinstance(choices, list) and choices else None
+            reason = choice.get("finish_reason") if isinstance(choice, Mapping) else None
+        if isinstance(reason, str) and reason in _OUTPUT_LIMIT_REASONS:
+            raise AIReportError("模型达到生成长度上限，未返回完整报告。请增大上下文或输出额度，或减少报告输入。")
 
     def _run_orchestration(
         self,
@@ -878,8 +944,10 @@ class AIReportService:
                 raise AIReportError(f"未知的报告队列任务类型：{task.kind}")
             payload = task.payload
             provider = self._deserialize_provider(payload["provider"])
-            resolver = api_key_resolver or self.api_key_from_env
-            api_key = resolver(provider.name)
+            if api_key_resolver is not None:
+                api_key = api_key_resolver(provider.name)
+            else:
+                api_key = report_model_key(provider)
             report = self.generate(
                 self._deserialize_record(payload["record"]),
                 provider,
@@ -953,18 +1021,31 @@ class AIReportService:
         buffer = bytearray()
         parts: list[str] = []
         received_chars = 0
+        thinking_reported = False
+        finished = False
 
         def consume_line(line: bytes) -> None:
-            nonlocal received_chars
+            nonlocal received_chars, thinking_reported, finished
             if not line.startswith(b"data:"):
                 return
             payload = line[5:].strip()
-            if not payload or payload == b"[DONE]":
+            if payload == b"[DONE]":
+                finished = True
+                return
+            if not payload:
                 return
             try:
                 event = json.loads(payload.decode("utf-8"))
             except (json.JSONDecodeError, UnicodeDecodeError):
                 return
+            if not isinstance(event, Mapping):
+                return
+            AIReportService._check_report_response(event, protocol)
+            if protocol == "anthropic" and event.get("type") == "message_stop":
+                finished = True
+            if not thinking_reported and not received_chars and AIReportService._has_thinking(event, protocol):
+                thinking_reported = True
+                state.report_progress(kind="model_thinking", agent=agent)
             fragment = AIReportService._stream_fragment(event, protocol)
             if not fragment:
                 return
@@ -976,22 +1057,35 @@ class AIReportService:
                 chars=received_chars,
             )
 
-        while True:
+        while not finished:
             state.check_cancelled()
             chunk = read(_READ_CHUNK)
+            state.check_cancelled()
             if not chunk:
                 break
             buffer.extend(chunk)
-            while b"\n" in buffer:
+            while not finished and b"\n" in buffer:
                 line, _, remainder = buffer.partition(b"\n")
                 buffer = bytearray(remainder)
                 consume_line(line.rstrip(b"\r"))
-        if buffer:
+        if buffer and not finished:
             consume_line(bytes(buffer).rstrip(b"\r"))
         text = "".join(parts).strip()
         if not text:
+            if thinking_reported:
+                raise AIReportError("模型只返回了思考内容。请检查上下文和输出额度后重新生成。")
             raise AIReportError("API 流式响应未包含报告文本。")
         return text
+
+    @staticmethod
+    def _has_thinking(data: Mapping[str, Any], protocol: str) -> bool:
+        if protocol == "anthropic":
+            delta = data.get("delta") or {}
+            return delta.get("type") in {"thinking_delta", "signature_delta"}
+        choices = data.get("choices") or []
+        choice = choices[0] if choices else {}
+        delta = (choice or {}).get("delta") or {}
+        return bool(delta.get("reasoning_content") or delta.get("reasoning"))
 
     @staticmethod
     def _stream_fragment(data: dict[str, Any], protocol: str) -> str:
@@ -1024,6 +1118,7 @@ class AIReportService:
         while True:
             state.check_cancelled()
             chunk = read(_READ_CHUNK)
+            state.check_cancelled()
             if not chunk:
                 return bytes(buffer)
             buffer.extend(chunk)
@@ -1032,6 +1127,92 @@ class AIReportService:
     def _raise_if_cancelled(cancel_requested: Callable[[], bool] | None):
         if cancel_requested is not None and cancel_requested():
             raise AIReportCancelled("AI 报告生成已取消。")
+
+    @staticmethod
+    def list_models(provider: ProviderConfig, api_key: str, *, timeout: float = 12) -> tuple[str, ...]:
+        """Read model IDs without sending a completion or requiring a selected model."""
+        base_url = ProviderConfig.normalize_base_url(provider.protocol, provider.base_url)
+        endpoint = base_url + "/models"
+        headers = provider.request_headers(api_key)
+        headers["Accept"] = "application/json"
+        model_ids: dict[str, None] = {}
+        cursors: set[str] = set()
+        url = endpoint
+        max_bytes = 1024 * 1024
+        for _ in range(10):
+            request = urllib.request.Request(url, headers=headers, method="GET")
+            try:
+                with open_custom_request(request, timeout=timeout) as response:
+                    body = response.read(max_bytes + 1)
+            except urllib.error.HTTPError as exc:
+                exc.close()
+                message = {
+                    401: "请核对 API Key。",
+                    403: "请检查密钥的模型列表访问权限。",
+                    404: "请核对 API 地址。如果服务未开放模型列表，可手动输入模型 ID。",
+                    405: "该地址未开放模型列表，请手动输入模型 ID。",
+                    429: "接口请求过于频繁，请稍后重试。",
+                }.get(exc.code, "请检查接口地址与服务状态。")
+                raise AIReportError(f"获取模型失败（HTTP {exc.code}）。{message}") from exc
+            except (urllib.error.URLError, OSError, HTTPException) as exc:
+                raise AIReportError("获取模型失败，请检查网络、地址或服务状态。") from exc
+            if len(body) > max_bytes:
+                raise AIReportError("模型列表响应超出大小限制，请手动输入模型 ID。")
+            try:
+                payload = json.loads(body)
+            except (ValueError, RecursionError) as exc:
+                raise AIReportError("服务返回的模型列表格式无效，可手动输入模型 ID。") from exc
+            if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+                raise AIReportError("服务返回的模型列表格式无效，可手动输入模型 ID。")
+            for item in payload["data"]:
+                model_id = item.get("id") if isinstance(item, dict) else None
+                if isinstance(model_id, str):
+                    try:
+                        model_ids[ProviderConfig.normalize_model_id(model_id)] = None
+                    except ValueError:
+                        continue
+            if provider.protocol != "anthropic" or payload.get("has_more") is not True:
+                return tuple(model_ids)
+            cursor = payload.get("last_id")
+            if not isinstance(cursor, str) or not cursor or cursor in cursors or len(cursor) > 1024:
+                raise AIReportError("模型列表分页信息无效，可手动输入模型 ID。")
+            cursors.add(cursor)
+            url = endpoint + "?" + urlencode({"after_id": cursor})
+        raise AIReportError("模型列表分页超过限制，请手动输入模型 ID。")
+
+    @staticmethod
+    def test_connection(
+        provider: ProviderConfig, api_key: str, *, model: str | None = None, timeout: float = 60,
+    ) -> None:
+        payload = {
+            "model": model or provider.default_model,
+            "messages": [{"role": "user", "content": "Reply with OK."}],
+        }
+        if provider.protocol == "anthropic":
+            payload["max_tokens"] = 32
+        request = urllib.request.Request(
+            provider.endpoint, data=json.dumps(payload).encode("utf-8"),
+            headers=provider.request_headers(api_key), method="POST",
+        )
+        try:
+            with open_custom_request(request, timeout=timeout) as response:
+                body = response.read(256 * 1024 + 1)
+        except urllib.error.HTTPError as exc:
+            exc.close()
+            message = {
+                401: "请核对 API Key。", 403: "请检查 API Key 的模型访问权限。",
+                404: "请核对接口地址和模型 ID。", 429: "请检查额度或稍后重试。",
+            }.get(exc.code, "请检查接口配置与服务状态。")
+            raise AIReportError(f"连接测试失败（HTTP {exc.code}）。{message}") from exc
+        except (urllib.error.URLError, OSError, HTTPException) as exc:
+            raise AIReportError("连接测试失败，请检查网络、地址或服务状态。") from exc
+        if len(body) > 256 * 1024:
+            raise AIReportError("测试响应超出大小限制。")
+        try:
+            if not AIReportService._extract_text(json.loads(body), provider.protocol):
+                raise ValueError("empty completion")
+        except (AIReportError, ValueError, TypeError, AttributeError, KeyError, IndexError) as exc:
+            raise AIReportError("接口已响应，但返回格式与所选协议不匹配，或模型未返回文本。") from exc
 
     @staticmethod
     def _extract_text(data: dict, protocol: str) -> str:
@@ -1046,5 +1227,4 @@ class AIReportService:
 
     @staticmethod
     def api_key_from_env(provider_name: str) -> str:
-        aliases = {"OpenAI": "OPENAI_API_KEY", "Anthropic": "ANTHROPIC_API_KEY", "DeepSeek": "DEEPSEEK_API_KEY", "Kimi": "MOONSHOT_API_KEY", "GLM": "GLM_API_KEY", "豆包": "DOUBAO_API_KEY"}
-        return os.getenv(aliases.get(provider_name, ""), "")
+        return report_key_from_env(provider_name)

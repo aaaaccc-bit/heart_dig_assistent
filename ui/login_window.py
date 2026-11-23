@@ -494,6 +494,7 @@ class Widget(QWidget):
         self._root_layout = root
 
         self._build_pages()
+        self._closing_after_report = False
 
         self.loader = DataLoader(self)
         self.loader.loaded.connect(self._on_dashboard_loaded)
@@ -537,11 +538,15 @@ class Widget(QWidget):
         showing_dashboard = self.stack.currentWidget() is old_dashboard
         account = old_dashboard._account
         data = old_dashboard.data
-        showing_sample_analysis = old_dashboard._sample_page is not None
+        settings_page = old_dashboard.settings_page
+        showing_report = old_dashboard.showing_report
+        settings_draft = settings_page.draft() if settings_page is not None else None
+        report_panel, report_context = old_dashboard.take_report_panel()
+        showing_sample_analysis = not showing_report and settings_page is None and old_dashboard._sample_page is not None
         sample_regression = old_dashboard._sample_regression_result
         sample_forest = old_dashboard._sample_forest_result
         sample_neural = old_dashboard._sample_neural_result
-        sample_dataset = old_dashboard._sample_dataset
+        sample_evaluation = old_dashboard._sample_classification_result
         login_account = old_login.account_field.text()
         login_password = old_login.password_field.line_edit.text()
         remember = old_login.remember.isChecked()
@@ -556,15 +561,30 @@ class Widget(QWidget):
         if showing_dashboard:
             self.dashboard.set_account(account)
             if self._has_data:
-                self.dashboard.set_data(retheme_dashboard(data))
+                self.dashboard.set_data(
+                    retheme_dashboard(data), source=self._dataset_path,
+                    analysis_cache=old_dashboard._analysis_cache,
+                )
+                self.dashboard._sample_regression_result = sample_regression
+                self.dashboard._sample_forest_result = sample_forest
+                self.dashboard._sample_neural_result = sample_neural
+                self.dashboard._sample_classification_result = sample_evaluation
+                self.dashboard._risk_result = old_dashboard._risk_result
+                self.dashboard._cluster_result = old_dashboard._cluster_result
+                self.dashboard._feature_result = old_dashboard._feature_result
                 if showing_sample_analysis:
-                    self.dashboard._sample_regression_result = sample_regression
-                    self.dashboard._sample_forest_result = sample_forest
-                    self.dashboard._sample_neural_result = sample_neural
-                    self.dashboard._sample_dataset = sample_dataset
-                    self.dashboard._show_sample_analysis(cached=True)
+                    self.dashboard._show_sample_analysis()
             else:
                 self.dashboard.show_empty()
+        if report_panel is not None:
+            self.dashboard.adopt_report_panel(report_panel, report_context)
+        if showing_dashboard:
+            if showing_report:
+                self.dashboard._open_ai_report()
+            elif settings_page is not None:
+                self.dashboard._show_settings()
+                if settings_draft is not None:
+                    self.dashboard.settings_page.restore_draft(settings_draft)
             self.stack.setCurrentWidget(self.dashboard)
 
     def _show_main(self, account: str) -> None:
@@ -619,7 +639,7 @@ class Widget(QWidget):
             self._import_path = None
             self._import_name = None
 
-        self.dashboard.set_data(data)
+        self.dashboard.set_data(data, source=self._dataset_path)
         if imported is not None:
             self.dashboard.show_toast(f"已导入 {imported.name} · {data.total_count} 例")
 
@@ -643,6 +663,14 @@ class Widget(QWidget):
         )
 
     def closeEvent(self, event) -> None:  # noqa: N802
+        panel = self.dashboard.report_panel
+        if panel is not None and panel.is_running():
+            event.ignore()
+            if not self._closing_after_report:
+                self._closing_after_report = True
+                panel.generation_finished.connect(self.close)
+                panel.cancel_generation()
+            return
         self._loading_timer.stop()
         self.loader.wait(1500)
         super().closeEvent(event)
@@ -652,6 +680,7 @@ class Widget(QWidget):
         self.login_page.login_button.setText("安全登录")
         self.login_page.message.hide()
         self.stack.setCurrentWidget(self.login_page)
+        self.dashboard.clear_report_session()
         self.login_page.account_field.set_focus()
 
     @staticmethod

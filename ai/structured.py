@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from http.client import HTTPException
 from typing import Any, Callable, Mapping
 
-from .providers import ProviderConfig
+from .providers import ProviderConfig, open_custom_request
 from .tools import ToolRegistry
 
 
@@ -57,9 +57,11 @@ class StructuredModelClient:
         max_tool_rounds: int = 4,
         cancel_requested: Callable[[], bool] | None = None,
     ) -> Any:
-        key = (api_key or "").strip()
-        if not key:
-            raise StructuredOutputError("结构化模型调用缺少 API Key")
+        try:
+            headers = provider.request_headers(api_key or "")
+            url = provider.endpoint
+        except ValueError as exc:
+            raise StructuredOutputError(str(exc)) from exc
         model = model or provider.default_model
         schema = getattr(output_schema, "json_schema", None)
         schema_hint = (
@@ -76,22 +78,11 @@ class StructuredModelClient:
             raise StructuredOutputError("max_tool_rounds 不能为负数")
         if provider.protocol == "anthropic":
             messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
-            url = provider.base_url.rstrip("/") + "/messages"
-            headers = {
-                "x-api-key": key,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            }
         else:
             messages = [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt},
             ]
-            url = provider.base_url.rstrip("/") + "/chat/completions"
-            headers = {
-                "Authorization": f"Bearer {key}",
-                "content-type": "application/json",
-            }
         formatted_tools = self._format_tools(tools, provider.protocol) if tools else []
         for round_index in range(max_tool_rounds + 1):
             payload = self._build_payload(
@@ -102,7 +93,7 @@ class StructuredModelClient:
                 tools=formatted_tools,
                 temperature=temperature,
                 max_tokens=max_tokens,
-                json_mode=json_mode,
+                json_mode=json_mode and not provider.is_custom,
             )
             request = urllib.request.Request(
                 url,
@@ -111,7 +102,7 @@ class StructuredModelClient:
                 method="POST",
             )
             response = self._parse_response(
-                self._decode_json(self._request(request, cancel_requested)),
+                self._decode_json(self._request(request, cancel_requested, user_endpoint=provider.uses_user_endpoint)),
                 provider.protocol,
             )
             if response.tool_calls:
@@ -140,21 +131,24 @@ class StructuredModelClient:
         self,
         request: urllib.request.Request,
         cancel_requested: Callable[[], bool] | None,
+        *,
+        user_endpoint: bool = False,
     ) -> bytes:
         self._raise_if_cancelled(cancel_requested)
         try:
             if self.request_executor is not None:
                 raw = self.request_executor(request, self.timeout)
             else:
-                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                open_request = open_custom_request if user_endpoint else urllib.request.urlopen
+                with open_request(request, timeout=self.timeout) as response:
                     raw = self._read_body(response, cancel_requested)
         except StructuredOutputError:
             raise
         except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")[:500]
-            raise StructuredOutputError(
-                f"{request.full_url} 请求失败（HTTP {exc.code}）：{detail}"
-            ) from exc
+            with exc:
+                detail = "" if user_endpoint else exc.read(2048).decode("utf-8", errors="replace")[:500]
+            suffix = f"：{detail}" if detail else ""
+            raise StructuredOutputError(f"{request.full_url} 请求失败（HTTP {exc.code}）{suffix}") from exc
         except (urllib.error.URLError, TimeoutError, OSError, HTTPException) as exc:
             raise StructuredOutputError(f"无法连接结构化模型服务：{exc}") from exc
         self._raise_if_cancelled(cancel_requested)

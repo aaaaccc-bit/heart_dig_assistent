@@ -1,8 +1,8 @@
-"""Qt interface for selecting an AI provider and generating a report."""
+"""Report generation and review panel for the analysis reports page."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import inspect
 import math
@@ -11,30 +11,26 @@ from pathlib import Path
 from threading import Event
 
 from PySide6.QtCore import QObject, QThread, Qt, Signal, Slot
-from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
-    QComboBox,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
-    QFormLayout,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
     QInputDialog,
     QProgressBar,
     QPushButton,
-    QSlider,
     QTextEdit,
     QVBoxLayout,
+    QWidget,
 )
 
-from ai.providers import PROVIDER_PRESETS
+from ai.provider_settings import load_report_model, report_model_key
 from ai.report_generator import AIReportCancelled, AIReportError, AIReportService
-from ai.security_settings import load_security_settings, save_security_settings
-from ui.dashboard_data import DashboardData
+from ai.security_settings import load_security_settings
+from ui.dashboard_data import DATASET_NAME, DashboardData
 from ui.markdown_viewer import MarkdownViewer
-from ui.theme import COLORS, DEFAULT_FONT
+from ui.theme import COLORS, DEFAULT_FONT, theme_manager
 from algorithm.regression import RegressionResult
 from algorithm.random_forest import RandomForestResult
 
@@ -406,7 +402,8 @@ def build_cardio_report_record(
             )
         )
     return CardioReportRecord(
-        title="Cleveland 心脏风险分析报告",
+        title=("Cleveland 心脏风险分析报告" if data.dataset == DATASET_NAME
+               else f"{data.dataset} · 心脏风险分析报告"),
         kind_label="心脏病风险与模型评估分析",
         dataset_name=data.dataset,
         created_at=datetime.now(),
@@ -471,97 +468,74 @@ class AIReportWorker(QObject):
             self.completed.emit(text)
 
 
-class AIReportDialog(QDialog):
-    def __init__(self, record, parent=None, *, service: AIReportService | None = None):
+class AIReportPanel(QWidget):
+    preparation_requested = Signal()
+    skip_preparation_requested = Signal()
+    generation_finished = Signal()
+
+    def __init__(self, record=None, parent=None, *, service: AIReportService | None = None):
         super().__init__(parent)
         self.record = record
-        # 本地心脏风险知识库在后台线程懒加载，向量模型不可用时自动回退到哈希检索。
         self.service = service or AIReportService(retrieval_enabled=True)
         self.result_text: str | None = None
         self._thread: QThread | None = None
         self._worker: AIReportWorker | None = None
-        self._close_when_stopped = False
+        self._reset_after_generation = False
+        self._status_color = "#7C8B9D"
         self.approval_status = "pending_review"
         self.report_version = "1.0"
         self.rejection_reason = ""
         self.reviewer = ""
         self.reviewed_at: str | None = None
 
-        self.setWindowTitle("CardioScope · AI 分析报告")
-        self.setMinimumSize(820, 640)
-        self.resize(920, 720)
-        self.setWindowFlag(Qt.WindowContextHelpButtonHint, False)
-        self.setStyleSheet(self._dialog_stylesheet())
+        self.setObjectName("reportPanel")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         root = QVBoxLayout(self)
-        root.setContentsMargins(24, 20, 24, 20)
+        root.setContentsMargins(22, 20, 22, 20)
         root.setSpacing(12)
         title = QHBoxLayout()
-        title.addWidget(self._label("AI 分析报告", 21, "#17283B", 700))
+        title.addWidget(self._label("生成与审阅", 17, "text", True))
         title.addStretch(1)
-        title.addWidget(self._label(f"当前报告：{record.title}", 10, "#7C8B9D"))
+        self.record_label = self._label("", 12, "text_secondary")
+        title.addWidget(self.record_label)
         root.addLayout(title)
-        root.addWidget(self._label("选择供应商和 API 协议，基于当前心脏风险分析结果生成可审阅的中文报告。", 10, "#7C8B9D"))
 
-        form = QFormLayout()
-        form.setHorizontalSpacing(14)
-        form.setVerticalSpacing(9)
-        self.provider_combo = QComboBox()
-        self.provider_combo.addItems(list(PROVIDER_PRESETS))
-        self.provider_combo.currentTextChanged.connect(self._provider_changed)
-        form.addRow(self._label("供应商", 10, "#53677B", 700), self.provider_combo)
-        self.protocol_label = self._label("OpenAI 最新兼容格式", 10, "#0D9B92", 700)
-        form.addRow(self._label("API 协议", 10, "#53677B", 700), self.protocol_label)
-        self.endpoint_edit = QLineEdit()
-        self.endpoint_edit.setPlaceholderText("供应商 API 地址，可替换为企业代理或兼容网关")
-        form.addRow(self._label("API 地址", 10, "#53677B", 700), self.endpoint_edit)
-        self.model_combo = QComboBox()
-        form.addRow(self._label("模型", 10, "#53677B", 700), self.model_combo)
-        self.key_edit = QLineEdit()
-        self.key_edit.setEchoMode(QLineEdit.Password)
-        self.key_edit.setPlaceholderText("输入 API Key；也支持读取供应商对应环境变量")
-        form.addRow(self._label("API Key", 10, "#53677B", 700), self.key_edit)
-        security = load_security_settings()
-        self.security_mode_combo = QComboBox()
-        self.security_mode_combo.addItem("硬阻断高风险报告", "hard_block")
-        self.security_mode_combo.addItem("仅标记，转人工复核", "human_review")
-        self.security_mode_combo.setCurrentIndex(0 if security["mode"] == "hard_block" else 1)
-        self.security_mode_combo.currentIndexChanged.connect(self._save_security_settings)
-        form.addRow(self._label("高风险处理", 10, "#53677B", 700), self.security_mode_combo)
-        security_row = QHBoxLayout()
-        self.security_strength_slider = QSlider(Qt.Horizontal)
-        self.security_strength_slider.setRange(0, 100)
-        self.security_strength_slider.setValue(int(security["strength"]))
-        self.security_strength_slider.valueChanged.connect(self._save_security_settings)
-        self.security_strength_label = self._label("", 9, "#7C8B9D")
-        security_row.addWidget(self.security_strength_slider, 1)
-        security_row.addWidget(self.security_strength_label)
-        form.addRow(self._label("安全对齐强度", 10, "#53677B", 700), security_row)
-        root.addLayout(form)
+        context = QHBoxLayout()
+        self.model_summary = self._label("", 12, "text_secondary")
+        self.model_summary.setWordWrap(True)
+        context.addWidget(self.model_summary, 1)
+        self.prepare_button = QPushButton("准备报告")
+        self.prepare_button.setObjectName("reportButton")
+        self.prepare_button.clicked.connect(self.preparation_requested.emit)
+        context.addWidget(self.prepare_button)
+        self.skip_button = QPushButton("跳过等待")
+        self.skip_button.setObjectName("reportButton")
+        self.skip_button.clicked.connect(self.skip_preparation_requested.emit)
+        self.skip_button.hide()
+        context.addWidget(self.skip_button)
+        root.addLayout(context)
 
-        root.addWidget(self._label("报告要求（可选）", 10, "#53677B", 700))
+        root.addWidget(self._label("报告要求（可选）", 12, "text", True))
         self.instruction_edit = QTextEdit()
         self.instruction_edit.setPlaceholderText("例如：重点解释阳性组与阴性组的差异，并用审慎语气说明统计局限性。")
         self.instruction_edit.setFixedHeight(74)
         root.addWidget(self.instruction_edit)
 
-        root.addWidget(self._label("Markdown 阅读器", 10, "#53677B", 700))
+        root.addWidget(self._label("报告预览", 12, "text", True))
         self.result_edit = MarkdownViewer()
         self.result_edit.setReadOnly(True)
+        self.result_edit.setMinimumHeight(200)
         root.addWidget(self.result_edit, 1)
-        self.status_label = self._label("", 9, "#C24545")
+        self.status_label = self._label("", 11, "text_secondary")
         root.addWidget(self.status_label)
         progress_row = QHBoxLayout()
-        self.agent_progress_label = self._label("等待 Agent 编排", 9, "#60758A")
+        self.agent_progress_label = self._label("等待生成", 11, "text_secondary")
         progress_row.addWidget(self.agent_progress_label, 1)
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
         self.progress_bar.setTextVisible(False)
         self.progress_bar.setFixedWidth(190)
-        self.progress_bar.setStyleSheet(
-            f"QProgressBar {{ background: {COLORS['grid']}; border: none; border-radius: 4px; height: 8px; }}"
-            f"QProgressBar::chunk {{ background: {COLORS['primary']}; border-radius: 4px; }}"
-        )
         progress_row.addWidget(self.progress_bar)
         root.addLayout(progress_row)
 
@@ -570,27 +544,12 @@ class AIReportDialog(QDialog):
         self.cancel_button = QPushButton("取消")
         self.cancel_button.setFixedSize(84, 36)
         self.cancel_button.setCursor(Qt.PointingHandCursor)
-        self.cancel_button.setStyleSheet(
-            f"QPushButton {{ background: {COLORS['surface']}; color: {COLORS['text_secondary']}; border: 1px solid {COLORS['border']}; border-radius: 9px; font-family: '{DEFAULT_FONT}'; font-size: 10px; }}"
-            f"QPushButton:hover {{ background: {COLORS['surface_hover']}; }}"
-            f"QPushButton:disabled {{ color: {COLORS['disabled_text']}; background: {COLORS['disabled_surface']}; }}"
-        )
         self.cancel_button.clicked.connect(self.cancel_generation)
         self.cancel_button.hide()
         actions.addWidget(self.cancel_button)
-        self.close_button = QPushButton("关闭")
-        self.close_button.setFixedSize(84, 36)
-        self.close_button.setCursor(Qt.PointingHandCursor)
-        self.close_button.clicked.connect(self.close)
-        actions.addWidget(self.close_button)
         self.clear_button = QPushButton("清空")
         self.clear_button.setFixedSize(84, 36)
         self.clear_button.setCursor(Qt.PointingHandCursor)
-        self.clear_button.setStyleSheet(
-            f"QPushButton {{ background: {COLORS['surface']}; color: {COLORS['text_secondary']}; border: 1px solid {COLORS['border']}; border-radius: 9px; font-family: '{DEFAULT_FONT}'; font-size: 10px; }}"
-            f"QPushButton:hover {{ background: {COLORS['surface_hover']}; }}"
-            f"QPushButton:disabled {{ color: {COLORS['disabled_text']}; background: {COLORS['disabled_surface']}; }}"
-        )
         self.clear_button.clicked.connect(self.clear_result)
         actions.addWidget(self.clear_button)
         self.approve_button = QPushButton("通过审核")
@@ -609,95 +568,95 @@ class AIReportDialog(QDialog):
         self.reject_button.setEnabled(False)
         actions.addWidget(self.reject_button)
         self.export_button = QPushButton("导出 Markdown")
-        self.export_button.setFixedSize(110, 36)
+        self.export_button.setMinimumWidth(130)
+        self.export_button.setFixedHeight(36)
         self.export_button.clicked.connect(self.export_report)
         self.export_button.setEnabled(False)
         actions.addWidget(self.export_button)
         self.generate_button = QPushButton("生成分析报告")
         self.generate_button.setFixedSize(126, 36)
         self.generate_button.setCursor(Qt.PointingHandCursor)
-        self.generate_button.setStyleSheet(
-            f"QPushButton {{ color: {COLORS['surface']}; background: {COLORS['primary']}; border: none; border-radius: 9px; font-family: '{DEFAULT_FONT}'; font-size: 10px; font-weight: 700; }} "
-            f"QPushButton:hover {{ background: {COLORS['primary_hover']}; }} "
-            f"QPushButton:disabled {{ background: {COLORS['primary_disabled']}; }}"
-        )
         self.generate_button.clicked.connect(self.generate_report)
         actions.addWidget(self.generate_button)
         root.addLayout(actions)
-        self._provider_changed(self.provider_combo.currentText())
-        self._save_security_settings()
+        for button in (self.cancel_button, self.clear_button, self.approve_button,
+                       self.revise_button, self.reject_button, self.export_button):
+            button.setObjectName("reportButton")
+        self.generate_button.setObjectName("reportPrimary")
+        self.refresh_report_model()
+        self.set_record(record)
+        self.apply_theme()
+
+    def apply_theme(self) -> None:
+        self.setStyleSheet(f"""
+        QWidget#reportPanel {{ background: {COLORS['surface']}; border: 1px solid {COLORS['border']}; border-radius: 18px; }}
+        QLabel[reportRole="text"] {{ color: {COLORS['text']}; }}
+        QLabel[reportRole="text_secondary"] {{ color: {COLORS['text_secondary']}; }}
+        QTextEdit {{ background: {COLORS['input']}; color: {COLORS['text']};
+            border: 1px solid {COLORS['border']}; border-radius: 9px; padding: 8px;
+            font-family: "{DEFAULT_FONT}"; font-size: 12px; }}
+        QTextEdit:focus {{ border-color: {COLORS['primary']}; }}
+        QProgressBar {{ background: {COLORS['grid']}; border: none; border-radius: 4px; height: 8px; }}
+        QProgressBar::chunk {{ background: {COLORS['primary']}; border-radius: 4px; }}
+        QPushButton#reportButton, QPushButton#reportPrimary {{
+            min-height: 35px; padding: 0 13px; border-radius: 8px; font-size: 12px; font-weight: 600;
+        }}
+        QPushButton#reportButton {{ background: {COLORS['surface']}; color: {COLORS['text']};
+            border: 1px solid {COLORS['border']}; }}
+        QPushButton#reportButton:hover {{ background: {COLORS['surface_hover']}; border-color: {COLORS['border_strong']}; }}
+        QPushButton#reportButton:disabled {{ color: {COLORS['disabled_text']}; }}
+        QPushButton#reportPrimary {{ background: {COLORS['primary']};
+            color: {COLORS['navy'] if theme_manager.is_dark else '#FFFFFF'}; border: 1px solid {COLORS['primary']}; }}
+        QPushButton#reportPrimary:hover {{ background: {COLORS['primary_hover']}; }}
+        QPushButton#reportPrimary:disabled {{ background: {COLORS['disabled_surface']};
+            color: {COLORS['disabled_text']}; border-color: {COLORS['border']}; }}
+        """)
+        self.result_edit.apply_theme()
+        self._set_status(self.status_label.text(), self._status_color)
 
     @staticmethod
-    def _dialog_stylesheet() -> str:
-        return f"""
-        QDialog {{ background: {COLORS["page"]}; color: {COLORS["text"]}; }}
-        QLineEdit, QComboBox, QTextEdit {{
-            background: {COLORS["surface"]};
-            color: {COLORS["text"]};
-            border: 1px solid {COLORS["border"]};
-            border-radius: 9px;
-            padding: 7px 9px;
-            font-family: "{DEFAULT_FONT}";
-            font-size: 10px;
-        }}
-        QLineEdit:focus, QComboBox:focus, QTextEdit:focus {{
-            border-color: {COLORS["primary"]};
-        }}
-        QTextEdit {{ padding: 9px; }}
-        QComboBox QAbstractItemView {{
-            background: {COLORS["surface"]};
-            color: {COLORS["text"]};
-            selection-background-color: {COLORS["primary_light"]};
-            selection-color: {COLORS["primary"]};
-        }}
-        QSlider::groove:horizontal {{
-            background: {COLORS["grid"]};
-            height: 6px;
-            border-radius: 3px;
-        }}
-        QSlider::handle:horizontal {{
-            background: {COLORS["primary"]};
-            width: 14px;
-            margin: -4px 0;
-            border-radius: 7px;
-        }}
-        QProgressBar {{
-            background: {COLORS["grid"]};
-            border: none;
-            border-radius: 4px;
-            height: 8px;
-        }}
-        QProgressBar::chunk {{ background: {COLORS["primary"]}; border-radius: 4px; }}
-        """
-
-    @staticmethod
-    def _label(text, size, color, weight=400):
+    def _label(text: str, size: int, role: str, bold: bool = False) -> QLabel:
         label = QLabel(text)
-        label.setStyleSheet(
-            f"color: {_theme_color(color)}; background: transparent; "
-            f"font-family: '{DEFAULT_FONT}'; font-size: {size}px; font-weight: {weight};"
-        )
+        label.setTextFormat(Qt.TextFormat.PlainText)
+        label.setProperty("reportRole", role)
+        font = label.font()
+        font.setFamily(DEFAULT_FONT)
+        font.setPixelSize(size)
+        font.setBold(bold)
+        label.setFont(font)
         return label
 
-    def _provider_changed(self, name):
-        config = PROVIDER_PRESETS[name]
-        self.protocol_label.setText("Anthropic 最新格式" if config.protocol == "anthropic" else "OpenAI 最新兼容格式")
-        self.endpoint_edit.setText(config.base_url)
-        self.model_combo.clear()
-        self.model_combo.addItem("自动选择")
-        for model in config.models:
-            self.model_combo.addItem(model, model)
-        self.key_edit.setText(self.service.api_key_from_env(name))
+    def refresh_report_model(self) -> None:
+        config = load_report_model()
+        provider = config.provider
+        model = provider.default_model if provider.is_custom else config.model or "自动选择模型"
+        self.model_summary.setText(f"当前模型 · {provider.name} / {model}   ·   在「系统设置」的「报告模型」中修改")
 
-    def _save_security_settings(self):
-        strength = self.security_strength_slider.value()
-        save_security_settings(
-            mode=str(self.security_mode_combo.currentData()),
-            strength=strength,
-        )
-        self.security_strength_label.setText(
-            f"{strength}（≥50 时硬阻断生效）"
-        )
+    def set_record(self, record) -> None:
+        self.record = record
+        self.record_label.setText(record.title if record is not None else "等待分析结果")
+        self.prepare_button.setVisible(record is None and not self.is_running())
+        self.skip_button.hide()
+        self.generate_button.setEnabled(record is not None and not self.is_running())
+
+    def set_preparing(self) -> None:
+        self.prepare_button.hide()
+        self.skip_button.show()
+        self.record_label.setText("正在汇总分析结果…")
+        self._set_status("", "#7C8B9D")
+
+    def set_preparation_error(self, message: str) -> None:
+        self.set_record(None)
+        self._set_status(message, "#C24545")
+
+    def reset_record(self) -> None:
+        self.set_record(None)
+        if self.is_running():
+            self._reset_after_generation = True
+            self.cancel_generation()
+        else:
+            self.clear_result()
+            self._set_status("", "#7C8B9D")
 
     # ------------------------------------------------------------ generation
     def clear_result(self):
@@ -713,18 +672,19 @@ class AIReportDialog(QDialog):
         self._set_review_buttons(False)
         self.result_edit.clear()
         self.progress_bar.setValue(0)
-        self.agent_progress_label.setText("等待 Agent 编排")
+        self.agent_progress_label.setText("等待生成")
         self._set_status("已清空报告内容，可再次生成。", "#7C8B9D")
 
     def generate_report(self):
-        if self.is_running():
+        if self.is_running() or self.record is None:
             return
-        provider_name = self.provider_combo.currentText()
-        config = PROVIDER_PRESETS[provider_name]
-        config = replace(config, base_url=self.endpoint_edit.text().strip() or config.base_url)
-        api_key = self.key_edit.text().strip() or self.service.api_key_from_env(provider_name)
-        if not api_key:
-            self._set_status("请先填写 API Key，或在环境变量中配置对应密钥。", "#C24545")
+        settings = load_report_model()
+        config = settings.provider
+        api_key = report_model_key(config)
+        try:
+            config.request_headers(api_key)
+        except ValueError as exc:
+            self._set_status(f"{exc} 请在「系统设置」的「报告模型」中更新 {config.name} 的设置。", "#C24545")
             return
         self.result_text = None
         self.approval_status = "pending_review"
@@ -745,7 +705,7 @@ class AIReportDialog(QDialog):
             self.record,
             config,
             api_key,
-            self.model_combo.currentData(),
+            settings.model,
             self.instruction_edit.toPlainText(),
         )
         worker.moveToThread(thread)
@@ -757,7 +717,9 @@ class AIReportDialog(QDialog):
         worker.completed.connect(thread.quit)
         worker.failed.connect(thread.quit)
         worker.cancelled.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
         thread.finished.connect(self._on_thread_finished)
+        thread.finished.connect(thread.deleteLater)
         self._thread = thread
         self._worker = worker
         # 模型初始化/下载属于耗时的后台工作，使用低优先级线程，避免
@@ -774,6 +736,8 @@ class AIReportDialog(QDialog):
 
     @Slot(str)
     def _on_completed(self, text: str):
+        if self._reset_after_generation:
+            return
         self.result_text = text
         self.approval_status = "blocked" if "## 安全硬阻断" in text else "pending_review"
         self.report_version = "1.0"
@@ -908,6 +872,10 @@ class AIReportDialog(QDialog):
                 f"{agent} · 输入 {int(event.get('prompt_chars', 0)):,} 字符",
                 "#2B6EDE",
             )
+        elif kind == "model_waiting":
+            self.agent_progress_label.setText(f"● {agent} · 正在等待模型响应")
+        elif kind == "model_thinking":
+            self.agent_progress_label.setText(f"● {agent} · 模型正在思考")
         elif kind == "model_chunk":
             chars = int(event.get("chars", 0) or 0)
             self.agent_progress_label.setText(f"● {agent} 生成中 · 已接收 {chars:,} 字符")
@@ -928,39 +896,31 @@ class AIReportDialog(QDialog):
 
     @Slot()
     def _on_thread_finished(self):
-        self._set_running(False)
-        if self._worker is not None:
-            self._worker.deleteLater()
+        self._thread = None
         self._worker = None
-        if self._close_when_stopped:
-            self._close_when_stopped = False
-            self.close()
+        self._set_running(False)
+        if self._reset_after_generation:
+            self._reset_after_generation = False
+            self.reset_record()
+        self.generation_finished.emit()
 
     # --------------------------------------------------------------- helpers
     def _set_running(self, running: bool):
-        for widget in (
-            self.provider_combo,
-            self.endpoint_edit,
-            self.model_combo,
-            self.key_edit,
-            self.instruction_edit,
-            self.security_mode_combo,
-            self.security_strength_slider,
-        ):
-            widget.setEnabled(not running)
-        self.generate_button.setEnabled(not running)
+        self.instruction_edit.setEnabled(not running)
+        self.generate_button.setEnabled(not running and self.record is not None)
         self.clear_button.setEnabled(not running)
         if running:
             for button in (self.approve_button, self.revise_button, self.reject_button, self.export_button):
                 button.setEnabled(False)
         else:
-            self._set_review_buttons(self.approval_status != "blocked")
+            self._set_review_buttons(bool(self.result_text) and self.approval_status != "blocked")
         self.cancel_button.setVisible(running)
         self.cancel_button.setEnabled(running)
         if running:
             self.cancel_button.setText("取消")
 
     def _set_status(self, text: str, color: str):
+        self._status_color = color
         self.status_label.setText(text)
         self.status_label.setStyleSheet(
             f"color: {_theme_color(color)}; background: transparent;"
@@ -968,22 +928,7 @@ class AIReportDialog(QDialog):
         )
 
     def is_running(self) -> bool:
-        return self._thread is not None and self._thread.isRunning()
-
-    def closeEvent(self, event: QCloseEvent):
-        if self.is_running():
-            self._close_when_stopped = True
-            self.cancel_generation()
-            event.ignore()
-            return
-        super().closeEvent(event)
-
-    def reject(self):
-        if self.is_running():
-            self._close_when_stopped = True
-            self.cancel_generation()
-            return
-        super().reject()
+        return self._thread is not None
 
 
-__all__ = ["AIReportDialog", "AIReportWorker", "CardioReportRecord", "build_cardio_report_record"]
+__all__ = ["AIReportPanel", "AIReportWorker", "CardioReportRecord", "build_cardio_report_record"]

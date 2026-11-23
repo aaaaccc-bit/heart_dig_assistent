@@ -47,7 +47,10 @@ class ReportWorkflowTest(unittest.TestCase):
                 response = {"choices": [{"message": {"content": draft}}]}
             return BytesIO(json.dumps(response).encode())
 
-        with patch("ai.report_generator.urllib.request.urlopen", side_effect=respond):
+        with (
+            patch("ai.report_generator.urllib.request.urlopen", side_effect=respond),
+            patch("ai.report_generator.cancellable_request_opener", return_value=respond),
+        ):
             return self.service.generate(
                 self.record, self.provider, "test-key", model,
                 progress_callback=progress_callback or self.events.append,

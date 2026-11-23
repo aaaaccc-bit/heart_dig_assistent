@@ -20,9 +20,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from algorithm.dataset import load_dataset
+from collections.abc import Callable
+
 from algorithm.classification import ClassificationEvaluation
-from algorithm.regression import RegressionError, RegressionResult, run_logistic_regression
+from algorithm.regression import RegressionError, RegressionResult
 from algorithm.random_forest import RandomForestError, RandomForestResult, run_random_forest
 from algorithm.neural_network import ClassificationMetrics, NeuralNetworkResult
 from sklearn.calibration import calibration_curve
@@ -757,8 +758,11 @@ class SampleAnalysisPage(QWidget):
         neural_result: NeuralNetworkResult | None = None,
         evaluation_result: ClassificationEvaluation | None = None,
         parent: QWidget | None = None,
+        *,
+        run_regression: Callable[[tuple[str, ...]], RegressionResult],
     ) -> None:
         super().__init__(parent)
+        self._regression_runner = run_regression
         self.setMinimumSize(1120, 940)
         layout = QHBoxLayout(self)
         layout.setContentsMargins(24, 24, 24, 24)
@@ -878,7 +882,7 @@ class SampleAnalysisPage(QWidget):
 
     def _run_regression(self, predictors: tuple[str, ...]) -> None:
         try:
-            result = run_logistic_regression(load_dataset(), predictors=predictors)
+            result = self._regression_runner(predictors)
         except RegressionError:
             return
         self._set_regression_page(result)
